@@ -151,6 +151,8 @@ input[type='range']:focus-visible { outline: 2px solid var(--accent-2); outline-
 .btn-accent { background: rgba(255, 184, 107, 0.14); border-color: rgba(255, 184, 107, 0.35); color: var(--accent); }
 .btn-accent:hover { background: rgba(255, 184, 107, 0.24); }
 .row { display: flex; gap: 6px; }
+.row > .select { flex: 1; min-width: 0; width: auto; }
+.btn.btn-fit { flex: none; white-space: nowrap; }
 
 .toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; line-height: 1.3; }
 .toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }

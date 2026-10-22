@@ -3,7 +3,7 @@
 # Lucent
 
 **A real-time, progressive path tracer that runs entirely on your GPU.**<br>
-TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~46 kB gzipped
+TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~49 kB gzipped
 
 **[Open the live demo →](https://clark719664.github.io/lucent/)**
 
@@ -63,7 +63,9 @@ The glTF models above are in the in-app gallery and stream from the [Khronos glT
 
 - **Denoiser**: an SVGF-style edge-avoiding à-trous filter ([Dammertz 2010](https://jo.dreggn.org/home/2010_atrous.pdf), [Schied 2017](https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced)). The trace pass writes albedo, normal and depth guides at the first non-mirror vertex, so reflections and refractions keep their detail. Lighting is demodulated by albedo, filtered with a variance-guided luminance edge-stop, then multiplied back; the filter's reach shrinks as samples accumulate and it fades out by 1024 spp.
 - **Temporal reprojection**: when the camera moves, every sample projects its primary hit into the previous view and reuses that pixel's history if depth and normal agree. How much history a pixel may keep depends on how glossy it is, so mirrors and glass never smear.
-- **Adaptive preview**: resolution drops (never below half, upsampled with Catmull-Rom) only when frames take longer than 40 ms, and samples per frame adapt to the GPU when the camera is still.
+- **GPU budget**: work is scheduled against a share of wall-clock time instead of "as fast as possible". A token bucket earns GPU time as the clock runs and each frame only starts the samples it can afford, so a 25% budget means about 25% even when one sample costs more than a frame. The cost of a sample comes from GPU timer queries where the browser has them, and from a synchronous re-measure every 2 s where it does not.
+- **Presets and a system scan**: Eco, Balanced, High and Max bundle the budget with frame-rate cap, resolution, bounces and a stop-at sample count. *Scan system* times a few samples of the current scene, scales the cost to the full canvas and picks the preset; it runs once on a first visit and the result is kept in local storage. Once the stop count is reached the page stops drawing entirely, and it can pause whenever the window loses focus.
+- **Adaptive preview**: resolution drops (never below half, upsampled with Catmull-Rom) only when frames take longer than 40 ms.
 - **HUD** with samples per pixel, samples per second and camera paths per second, all measured.
 
 **Acceleration**
@@ -74,7 +76,7 @@ The glTF models above are in the in-app gallery and stream from the [Khronos glT
 **Engineering**
 
 - Strict TypeScript (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), ESLint, Vitest.
-- 69 unit tests: the glTF parser (GLB containers, hierarchies, strips, interleaved and sparse data, extensions), the RGBE decoder, alias tables, the environment pdf integrating to one, the sheen table against Monte Carlo, BVH invariants and BVH-vs-brute-force agreement, mesh generators, material and scene packing.
+- 79 unit tests: the GPU-budget scheduler (held to its budget in simulation for per-sample costs from 0.5 to 120 ms), preset recommendation, the glTF parser (GLB containers, hierarchies, strips, interleaved and sparse data, extensions), the RGBE decoder, alias tables, the environment pdf integrating to one, the sheen table against Monte Carlo, BVH invariants and BVH-vs-brute-force agreement, mesh generators, material and scene packing.
 - A `#include` preprocessor for GLSL that rewrites driver error messages back to chunk names and line numbers.
 - GitHub Actions for lint → typecheck → test → build, and a Pages deployment.
 
@@ -89,6 +91,8 @@ Measured with `Renderer.benchmark()`, which waits for the GPU with a 1-pixel rea
 | Toy Car | 108,936 | 54 M | 17.2 |
 | A Beautiful Game | 1,499,072 | 49 M | 19.0 |
 | Showroom | 9,682 | 47 M | 19.6 |
+
+Those figures are raw speed (the benchmark ignores the budget). With the budget in force, Windows' per-process GPU counters on the same machine read 44% for Balanced (50% budget), 26% for Eco (25%), and 0.3% once the stop count is reached, while the page keeps running.
 
 Showroom is slower than models with twenty times its triangles because sunlit glass and a mirror-finish gold knot keep paths alive for every bounce. One denoiser run costs 2–10 ms at this size. The 1.5 M-triangle chess set builds its BVH in about 3 s on the worker, then packs and uploads in under a second.
 

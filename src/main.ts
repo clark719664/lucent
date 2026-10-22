@@ -12,7 +12,9 @@ import { installDropZone, pickFiles } from './ui/drop';
 import { GalleryView } from './ui/gallery-view';
 import { Hud } from './ui/hud';
 import { OrbitControls } from './ui/orbit';
-import { Panel } from './ui/panel';
+import { gpuName, Panel } from './ui/panel';
+import { loadPrefs, savePrefs, type StoredScan } from './ui/prefs';
+import { PERFORMANCE_PRESETS, pickPerformance, PRESET_LABELS, recommend, type PerformanceSettings } from './perf';
 import './ui/styles.css';
 
 const PRESET_THUMBS = ['showroom', 'cornell', 'material', 'nocturne'];
@@ -52,6 +54,9 @@ function main(): void {
   const params = new URLSearchParams(location.search);
   const sceneIndex = Math.max(0, Math.min(PRESETS.length - 1, Number(params.get('scene') ?? 0) || 0));
   let scene = PRESETS[sceneIndex]!();
+  const prefs = loadPrefs();
+  if (prefs) Object.assign(renderer.settings, prefs.settings);
+  let lastScan: StoredScan | null = prefs?.scan ?? null;
   renderer.settings.exposure = scene.exposure;
   renderer.applySettings();
   renderer.loadScene(scene);
@@ -256,6 +261,12 @@ function main(): void {
     onResolutionChange: () => renderer.resize(),
     onReset: () => renderer.reset(),
     onScreenshot: () => void saveScreenshot(),
+    onPresetChange: (name) => {
+      applyPerformance(PERFORMANCE_PRESETS[name]);
+      notify(`${PRESET_LABELS[name]}: GPU budget ${Math.round(renderer.settings.gpuBudget * 100)}%`);
+    },
+    onScan: () => void runScan(),
+    onPerformanceChange: () => persist(),
   });
 
   const toggle = h('button', { class: 'toggle-panel', title: 'Show panel (H)', 'aria-label': 'Show panel', onClick: () => setPanelHidden(false) }, '☰');
@@ -308,18 +319,80 @@ function main(): void {
   const ro = new ResizeObserver(() => renderer.resize());
   ro.observe(canvas);
 
-  // Don't burn GPU while the tab is hidden, but don't override an explicit pause either.
-  let pausedByVisibility = false;
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      pausedByVisibility = !renderer.isPaused;
+  // Don't burn GPU while the tab is hidden (or, if asked, unfocused), but don't override an explicit pause either.
+  let pausedAutomatically = false;
+  const autoPause = (pause: boolean) => {
+    if (pause && !renderer.isPaused) {
+      pausedAutomatically = true;
       renderer.setPaused(true);
-    } else if (pausedByVisibility) {
-      pausedByVisibility = false;
+    } else if (!pause && pausedAutomatically) {
+      pausedAutomatically = false;
       renderer.setPaused(false);
     }
     panel.syncPauseButton();
+  };
+  document.addEventListener('visibilitychange', () => autoPause(document.hidden));
+  window.addEventListener('blur', () => {
+    if (renderer.settings.pauseWhenUnfocused) autoPause(true);
   });
+  window.addEventListener('focus', () => autoPause(false));
+
+  const persist = () => savePrefs({ settings: pickPerformance(renderer.settings), scan: lastScan });
+
+  /** Applies cost settings; a preset or scan result replaces all of them at once. */
+  const applyPerformance = (p: PerformanceSettings) => {
+    Object.assign(renderer.settings, p);
+    renderer.applySettings();
+    renderer.resize();
+    renderer.reset();
+    panel.refresh();
+    persist();
+  };
+
+  const scanNote = (s: StoredScan | null) =>
+    s
+      ? `Last scan: ${s.gpu}, ${s.msPerSample.toFixed(1)} ms per sample at ${s.width} × ${s.height} on ${s.scene}, so ${PRESET_LABELS[s.preset]}.`
+      : 'Scan system measures this GPU and picks a preset.';
+  panel.setScanNote(scanNote(lastScan));
+
+  /**
+   * Times a few samples of the current scene (at half resolution on a slow GPU,
+   * so it never stalls long), scales that to the full canvas, and applies the
+   * recommended preset.
+   */
+  const runScan = async () => {
+    if (canvas.clientWidth < 64 || canvas.clientHeight < 64) {
+      notify('The view is too small to measure; make the window larger and scan again.', 5000);
+      return;
+    }
+    notify('Scanning your GPU…', 0);
+    // Lets the toast paint before the GPU is kept busy; a timer also fires while the page is hidden.
+    await new Promise((r) => setTimeout(r, 50));
+    // Probe at half resolution first; only measure at full resolution if one sample there is cheap
+    // (per-draw overhead makes a scaled-up half-resolution figure read high).
+    const measureAt = (scale: number) => {
+      renderer.settings.resolutionScale = scale;
+      renderer.applySettings();
+      renderer.resize();
+      return renderer.benchmark(1);
+    };
+    renderer.settings.maxBounces = PERFORMANCE_PRESETS.balanced.maxBounces;
+    const probe = measureAt(0.5);
+    const scanScale = probe.traceMs * 4 < 250 ? 1 : 0.5;
+    const first = scanScale === 1 ? measureAt(1) : probe;
+    const count = Math.max(1, Math.min(32, Math.round(400 / Math.max(first.traceMs, 1))));
+    const b = renderer.benchmark(count);
+    const fullWidth = Math.round(b.width / scanScale);
+    const fullHeight = Math.round(b.height / scanScale);
+    const msPerSample = (b.traceMs / count) * ((fullWidth * fullHeight) / (b.width * b.height));
+    const rec = recommend({ msPerSample, width: fullWidth, height: fullHeight });
+    lastScan = { msPerSample, width: fullWidth, height: fullHeight, gpu: gpuName(renderer.caps.renderer), preset: rec.preset, scene: scene.name };
+    applyPerformance(rec.settings);
+    panel.setScanNote(scanNote(lastScan));
+    const s = rec.settings;
+    notify(`${lastScan.gpu}: ${msPerSample.toFixed(1)} ms per full-resolution sample, so ${PRESET_LABELS[rec.preset]} ` +
+      `(resolution ${Math.round(s.resolutionScale * 100)}%, GPU budget ${Math.round(s.gpuBudget * 100)}%, stop at ${s.maxSamples || 'never'} spp)`, 7000);
+  };
 
   const requested = params.get('model');
   const initialModel = MODELS.find((m) => m.id === requested);
@@ -327,21 +400,34 @@ function main(): void {
 
   if (import.meta.env.DEV) {
     // Console handle for debugging and for capturing README screenshots.
-    Object.assign(window, { lucent: { renderer, scene: () => scene, openModel, openPreset, selectEnvironment, MODELS } });
+    Object.assign(window, { lucent: { renderer, scene: () => scene, openModel, openPreset, selectEnvironment, runScan, MODELS } });
   }
 
+  // First visit: measure this GPU instead of guessing, once the canvas has a real size
+  // (a page opened in a hidden or collapsed view lays out at zero).
+  const scanWhenVisible = () => {
+    if (canvas.clientWidth >= 64 && canvas.clientHeight >= 64) void runScan();
+    else setTimeout(scanWhenVisible, 500);
+  };
+  if (!prefs) setTimeout(scanWhenVisible, 500);
+
   let lastStats = 0;
+  let lastRender = 0;
   const loop = (now: number) => {
-    try {
-      renderer.render();
-    } catch (err) {
-      showFatal(root, err);
-      return;
+    const cap = renderer.settings.fpsCap;
+    if (cap <= 0 || now - lastRender >= 1000 / cap - 2) {
+      lastRender = now;
+      try {
+        renderer.render();
+      } catch (err) {
+        showFatal(root, err);
+        return;
+      }
     }
     if (now - lastStats > 250) {
       const st = renderer.stats();
       panel.updateStats(st);
-      hud.update(st);
+      hud.update(st, renderer.isPaused);
       // Visual convergence indicator: ~1k samples reads as "done" for most scenes.
       const target = renderer.settings.maxSamples || 1024;
       const p = Math.min(1, st.samples / target);
