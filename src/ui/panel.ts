@@ -35,6 +35,10 @@ interface ToggleSpec {
   onChange: () => void;
 }
 
+/** "ANGLE (AMD, AMD Radeon RX 7600 (0x…) Direct3D11 …)" → "AMD Radeon RX 7600". */
+export const gpuName = (renderer: string): string =>
+  /^ANGLE \([^,]+, ([^,(]+)/.exec(renderer)?.[1]?.trim() ?? renderer;
+
 /** Builds the control panel. Pure DOM, no framework. */
 export class Panel {
   readonly root: HTMLElement;
@@ -217,7 +221,7 @@ export class Panel {
       ['Triangles', formatCount(st.triangles)],
       ['BVH nodes', formatCount(st.bvhNodes)],
       ['Textures', st.textures > 0 ? `${st.textures} @ ${st.textureSize}²` : 'none'],
-      ['GPU', st.renderer],
+      ['GPU', gpuName(st.renderer)],
     ];
     this.statsEl.replaceChildren(
       ...rows.map(([k, v]) => h('div', { class: 'stat' }, h('span', { class: 'stat-k' }, k), h('span', { class: 'stat-v', title: v }, v))),

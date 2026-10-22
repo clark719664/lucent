@@ -117,6 +117,8 @@ export interface FramingOptions {
   /** Multiplies the distance that just fits the bounding sphere. */
   distance?: number;
   exposure?: number;
+  groundColor?: Vec3;
+  groundRoughness?: number;
 }
 
 /**
@@ -156,7 +158,7 @@ export function sceneFromModel(model: LoadedModel, env: Environment, opts: Frami
     sky: daySky(1),
     env,
     // A hair below the model so flat bases do not z-fight with the plane.
-    ground: { enabled: true, height: -1e-3, material: matte([0.4, 0.4, 0.42], 0.9) },
+    ground: { enabled: true, height: -1e-3, material: matte(opts.groundColor ?? [0.4, 0.4, 0.42], opts.groundRoughness ?? 0.9) },
     spheres: [],
     meshes: model.asset.meshes.map(({ mesh, material }) => ({ mesh: placeMesh(mesh, offset, s), material: materials[material]! })),
     textures: model.textures,

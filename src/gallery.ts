@@ -37,6 +37,8 @@ export interface GalleryModel {
   azimuth?: number;
   elevation?: number;
   distance?: number;
+  groundColor?: readonly [number, number, number];
+  groundRoughness?: number;
   thumbnail: string;
 }
 
@@ -49,10 +51,12 @@ export const MODELS: readonly GalleryModel[] = [
   {
     id: 'ToyCar', name: 'Toy Car', features: 'Clearcoat · sheen · transmission',
     credit: 'Guido Odendahl, Eric Chadwick · CC0', megabytes: 5.4, hdri: 'studio_small_08', thumbnail: shot('ToyCar'),
+    azimuth: 24, elevation: 12, distance: 0.8,
   },
   {
     id: 'DragonAttenuation', name: 'Dragon', features: 'Volumetric absorption · refraction',
     credit: 'Stanford CG Lab, Morgan McGuire · glTF CC0', megabytes: 6.4, hdri: 'venice_sunset', thumbnail: shot('DragonAttenuation'),
+    azimuth: 10, elevation: 8, distance: 0.7,
   },
   {
     id: 'SheenChair', name: 'Sheen Chair', features: 'Fabric sheen · texture transforms',
@@ -65,6 +69,7 @@ export const MODELS: readonly GalleryModel[] = [
   {
     id: 'CarConcept', name: 'Car Concept', features: 'Clearcoat car paint · glass',
     credit: 'Darmstadt Graphics Group · CC BY', megabytes: 11.8, hdri: 'kiara_1_dawn', thumbnail: shot('CarConcept'),
+    azimuth: 38, elevation: 6, distance: 0.95, groundColor: [0.05, 0.05, 0.055], groundRoughness: 0.35,
   },
   {
     id: 'ChronographWatch', name: 'Chronograph Watch', features: 'Transmission · fine detail',
@@ -81,5 +86,6 @@ export const MODELS: readonly GalleryModel[] = [
   {
     id: 'ABeautifulGame', name: 'A Beautiful Game', features: '1.5M triangles · glass pieces',
     credit: 'ASWF, Ed Mackey · CC BY', megabytes: 43, hdri: 'brown_photostudio_02', thumbnail: shot('ABeautifulGame'),
+    azimuth: 20, elevation: 28, distance: 0.75, groundColor: [0.08, 0.07, 0.065], groundRoughness: 0.5,
   },
 ];
