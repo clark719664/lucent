@@ -3,7 +3,8 @@ import type { Ray } from '../math/ray';
 import { intersectSphere } from '../math/ray';
 import type { Vec3 } from '../math/vec3';
 import { cross, length, sub } from '../math/vec3';
-import { isEmissive, packMaterials, type Material } from './material';
+import type { Environment } from './environment';
+import { isEmissive, needsAlphaTest, packMaterials, type Material } from './material';
 import { mergeMeshes, triangleCount, type Mesh } from './mesh';
 
 export interface Camera {
@@ -36,6 +37,13 @@ export interface Sky {
   intensity: number;
 }
 
+/** An analytic infinite plane `y = height`; cheap, and needs no BVH rebuild when toggled. */
+export interface Ground {
+  enabled: boolean;
+  height: number;
+  material: Material;
+}
+
 export interface Sphere {
   center: Vec3;
   radius: number;
@@ -47,6 +55,12 @@ export interface MeshInstance {
   material: Material;
 }
 
+/** A decoded image; resampled on upload to the shared texture-array size. */
+export interface SceneTexture {
+  image: ImageBitmap;
+  name: string;
+}
+
 export interface Scene {
   name: string;
   description: string;
@@ -55,13 +69,19 @@ export interface Scene {
   camera: Camera;
   sun: Sun;
   sky: Sky;
+  env: Environment;
+  ground: Ground;
   spheres: Sphere[];
   meshes: MeshInstance[];
+  textures: SceneTexture[];
 }
 
 export const MAX_SPHERES = 64;
 export const MAX_LIGHTS = 8;
-export const TRI_TEXELS = 6;
+/** Triangle texels used by traversal: v0 (w = material), v1 (w = light), v2 (w = alpha-test flag). */
+export const GEO_TEXELS = 3;
+/** Shading texels, read once per hit: (n0, u0) (n1, u1) (n2, u2) (v0, v1, v2, 0). */
+export const ATTR_TEXELS = 4;
 export const BVH_TEXELS = 2;
 export const LIGHT_TEXELS = 4;
 
@@ -84,7 +104,8 @@ export interface Light {
 
 /** Everything the GPU needs, already laid out as texel arrays. */
 export interface PackedScene {
-  triangles: Float32Array;
+  triGeometry: Float32Array;
+  triAttributes: Float32Array;
   triCount: number;
   bvhNodes: Float32Array;
   bvhNodeCount: number;
@@ -98,11 +119,36 @@ export interface PackedScene {
   lights: Float32Array;
   lightCount: number;
   lightList: Light[];
+  /** Material index of the ground plane (packed even while it is disabled). */
+  groundMaterial: number;
+  /** Scene texture index stored in each layer of the sRGB (colour) and linear (data) arrays. */
+  colorLayers: number[];
+  dataLayers: number[];
   /** CPU-side copies kept for picking. */
   cpu: {
     positions: Float32Array;
     bvh: BVH;
     sphereList: Sphere[];
+    ground: Ground;
+  };
+}
+
+/** Assigns each referenced texture one layer in its array, in first-use order. */
+function layerMap(): { layers: number[]; layer: (tex: number) => number } {
+  const layers: number[] = [];
+  const index = new Map<number, number>();
+  return {
+    layers,
+    layer: (tex) => {
+      if (tex < 0) return -1;
+      let l = index.get(tex);
+      if (l === undefined) {
+        l = layers.length;
+        layers.push(tex);
+        index.set(tex, l);
+      }
+      return l;
+    },
   };
 }
 
@@ -110,20 +156,23 @@ export interface PackedScene {
  * Flattens a scene into GPU texel arrays.
  *
  * Triangles are written in BVH leaf order, so the shader indexes the triangle
- * texture directly from a leaf's `leftFirst` with no indirection table.
+ * textures directly from a leaf's `leftFirst` with no indirection table.
+ * `prebuilt` is a BVH over the merged meshes built elsewhere (a worker).
  */
-export function packScene(scene: Scene): PackedScene {
+export function packScene(scene: Scene, prebuilt?: BVH): PackedScene {
   if (scene.spheres.length > MAX_SPHERES) {
     throw new Error(`scene has ${scene.spheres.length} spheres; max is ${MAX_SPHERES}`);
   }
 
   // Materials are deduplicated by reference so shared library entries pack once.
   const materials: Material[] = [];
+  const materialIds = new Map<Material, number>();
   const materialIndex = (m: Material): number => {
-    let i = materials.indexOf(m);
-    if (i === -1) {
+    let i = materialIds.get(m);
+    if (i === undefined) {
       i = materials.length;
       materials.push(m);
+      materialIds.set(m, i);
     }
     return i;
   };
@@ -136,12 +185,15 @@ export function packScene(scene: Scene): PackedScene {
   };
 
   const merged = mergeMeshes(scene.meshes.map((m) => m.mesh));
-  const triMaterial = new Int32Array(triangleCount(merged));
-  const triLight = new Int32Array(triangleCount(merged)).fill(-1);
+  const triCount = triangleCount(merged);
+  const triMaterial = new Int32Array(triCount);
+  const triLight = new Int32Array(triCount).fill(-1);
+  const triAlpha = new Uint8Array(triCount);
   let cursor = 0;
   for (const inst of scene.meshes) {
     const n = triangleCount(inst.mesh);
     triMaterial.fill(materialIndex(inst.material), cursor, cursor + n);
+    if (needsAlphaTest(inst.material)) triAlpha.fill(1, cursor, cursor + n);
     // Emissive quads built with `quad()` become explicitly sampled area lights.
     const asQuad = isEmissive(inst.material) ? quadFromMesh(inst.mesh) : null;
     if (asQuad) {
@@ -151,21 +203,35 @@ export function packScene(scene: Scene): PackedScene {
     cursor += n;
   }
 
-  const bvh = buildBVH(merged.positions);
-  const triCount = triangleCount(merged);
-  const triangles = new Float32Array(triCount * TRI_TEXELS * 4);
+  if (prebuilt && prebuilt.triIndices.length !== triCount) {
+    throw new Error(`prebuilt BVH covers ${prebuilt.triIndices.length} triangles; scene has ${triCount}`);
+  }
+  const bvh = prebuilt ?? buildBVH(merged.positions);
+  const pos = merged.positions;
+  const nrm = merged.normals;
+  const uvs = merged.uvs;
+  const geo = new Float32Array(triCount * GEO_TEXELS * 4);
+  const attr = new Float32Array(triCount * ATTR_TEXELS * 4);
   for (let slot = 0; slot < triCount; slot++) {
     const src = bvh.triIndices[slot]!;
     const p = src * 9;
-    const o = slot * TRI_TEXELS * 4;
-    const pos = merged.positions;
-    const nrm = merged.normals;
-    triangles.set([pos[p]!, pos[p + 1]!, pos[p + 2]!, triMaterial[src]!], o);
-    triangles.set([pos[p + 3]!, pos[p + 4]!, pos[p + 5]!, triLight[src]!], o + 4);
-    triangles.set([pos[p + 6]!, pos[p + 7]!, pos[p + 8]!, 0], o + 8);
-    triangles.set([nrm[p]!, nrm[p + 1]!, nrm[p + 2]!, 0], o + 12);
-    triangles.set([nrm[p + 3]!, nrm[p + 4]!, nrm[p + 5]!, 0], o + 16);
-    triangles.set([nrm[p + 6]!, nrm[p + 7]!, nrm[p + 8]!, 0], o + 20);
+    const g = slot * GEO_TEXELS * 4;
+    const a = slot * ATTR_TEXELS * 4;
+    for (let v = 0; v < 3; v++) {
+      geo[g + v * 4] = pos[p + v * 3]!;
+      geo[g + v * 4 + 1] = pos[p + v * 3 + 1]!;
+      geo[g + v * 4 + 2] = pos[p + v * 3 + 2]!;
+      attr[a + v * 4] = nrm[p + v * 3]!;
+      attr[a + v * 4 + 1] = nrm[p + v * 3 + 1]!;
+      attr[a + v * 4 + 2] = nrm[p + v * 3 + 2]!;
+      if (uvs) {
+        attr[a + v * 4 + 3] = uvs[src * 6 + v * 2]!;
+        attr[a + 12 + v] = uvs[src * 6 + v * 2 + 1]!;
+      }
+    }
+    geo[g + 3] = triMaterial[src]!;
+    geo[g + 7] = triLight[src]!;
+    geo[g + 11] = triAlpha[src]!;
   }
 
   // BVH nodes are already 8 floats = 2 texels each, exactly the texture layout.
@@ -190,6 +256,9 @@ export function packScene(scene: Scene): PackedScene {
     }
   });
 
+  // Always packed, so the ground can be toggled with a uniform instead of a repack.
+  const groundMaterial = materialIndex(scene.ground.material);
+
   const lights = new Float32Array(MAX_LIGHTS * LIGHT_TEXELS * 4);
   lightList.forEach((l, i) => {
     const o = i * LIGHT_TEXELS * 4;
@@ -199,12 +268,27 @@ export function packScene(scene: Scene): PackedScene {
     lights.set([...l.radiance, 0], o + 12);
   });
 
+  // sRGB maps (base colour, emissive) and linear maps (metal-rough, normal) live in separate arrays.
+  const color = layerMap();
+  const data = layerMap();
+  const layered = materials.map((m) => ({
+    ...m,
+    baseColorMap: color.layer(m.baseColorMap),
+    emissiveMap: color.layer(m.emissiveMap),
+    metalRoughMap: data.layer(m.metalRoughMap),
+    normalMap: data.layer(m.normalMap),
+  }));
+  for (const t of [...color.layers, ...data.layers]) {
+    if (t >= scene.textures.length) throw new Error(`material references texture ${t}, scene has ${scene.textures.length}`);
+  }
+
   return {
-    triangles,
+    triGeometry: geo,
+    triAttributes: attr,
     triCount,
     bvhNodes,
     bvhNodeCount: bvh.nodeCount,
-    materials: packMaterials(materials),
+    materials: packMaterials(layered),
     materialCount: materials.length,
     spheres,
     sphereMaterials,
@@ -213,7 +297,10 @@ export function packScene(scene: Scene): PackedScene {
     lights,
     lightCount: lightList.length,
     lightList,
-    cpu: { positions: merged.positions, bvh, sphereList: scene.spheres },
+    groundMaterial,
+    colorLayers: color.layers,
+    dataLayers: data.layers,
+    cpu: { positions: merged.positions, bvh, sphereList: scene.spheres, ground: scene.ground },
   };
 }
 
@@ -244,6 +331,11 @@ export function pickDistance(packed: PackedScene, ray: Ray): number | null {
   for (const s of packed.cpu.sphereList) {
     const t = intersectSphere(ray, s.center, s.radius, 1e-5, best);
     if (t !== null) best = t;
+  }
+  const g = packed.cpu.ground;
+  if (g.enabled && Math.abs(ray.dir[1]) > 1e-9) {
+    const t = (g.height - ray.origin[1]) / ray.dir[1];
+    if (t > 1e-5 && t < best) best = t;
   }
   return Number.isFinite(best) ? best : null;
 }

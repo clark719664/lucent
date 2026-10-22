@@ -2,6 +2,7 @@
 precision highp float;
 precision highp int;
 precision highp sampler2D;
+precision highp sampler2DArray;
 
 #include "common.glsl"
 #include "scene.glsl"
@@ -9,8 +10,10 @@ precision highp sampler2D;
 #include "bsdf.glsl"
 
 uniform vec2 uResolution;
-uniform uint uFrame;          // samples accumulated so far
-uniform sampler2D uPrevious;  // running average
+uniform uint uFrame;            // samples accumulated so far
+uniform sampler2D uPrevColor;   // running averages, see the outputs below
+uniform sampler2D uPrevAlbedo;
+uniform sampler2D uPrevNormal;
 
 uniform vec3 uCamPos;
 uniform vec3 uCamRight;
@@ -23,17 +26,14 @@ uniform float uFocusDist;
 uniform int uMaxBounces;
 uniform float uClamp;         // max luminance an indirect sample may contribute
 
-out vec4 fragColor;
+// Running means: radiance + luminance² (for the denoiser's variance), and the
+// denoiser's guides — albedo + coverage, normal + depth — taken at the first
+// non-mirror vertex so that reflections and refractions keep their detail.
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outAlbedo;
+layout(location = 2) out vec4 outNormal;
 
-const float RAY_OFFSET = 1e-3;
-
-vec3 surfaceAlbedo(Material m, vec3 p) {
-  if (m.checkerScale <= 0.0) return m.albedo;
-  // Half-cell offset keeps surfaces lying exactly on a lattice plane (y = 0 floors) stable.
-  vec3 q = floor(p * m.checkerScale + 0.5);
-  float c = mod(q.x + q.y + q.z, 2.0);
-  return c < 0.5 ? m.albedo : m.albedo2;
-}
+const float FAR = 1e4;
 
 // Thin-lens camera ray with sub-pixel jitter for antialiasing.
 void cameraRay(vec2 fragCoord, out vec3 ro, out vec3 rd) {
@@ -54,47 +54,139 @@ vec3 clampContribution(vec3 c, int bounce) {
   return l > uClamp ? c * (uClamp / l) : c;
 }
 
-vec3 tracePath(vec3 ro, vec3 rd) {
+// Resolves textures, checkers and normal maps into the BSDF inputs at a hit.
+Surface surfaceAt(Hit hit, vec3 wo, out vec3 emission) {
+  Material m = fetchMaterial(hit.material);
+  Surface s;
+  vec2 uv = transformUV(hit.uv, m.uv0, m.uv1);
+
+  s.albedo = m.albedo;
+  if (m.checkerScale > 0.0) {
+    // Half-cell offset keeps surfaces lying exactly on a lattice plane (y = 0 floors) stable.
+    vec3 q = floor(hit.position * m.checkerScale + 0.5);
+    if (mod(q.x + q.y + q.z, 2.0) >= 0.5) s.albedo = m.albedo2;
+  }
+  if (m.maps.x >= 0) s.albedo *= textureLod(uColorMaps, vec3(uv, float(m.maps.x)), 0.0).rgb;
+
+  s.metallic = m.metallic;
+  s.roughness = m.roughness;
+  if (m.maps.y >= 0) {
+    vec4 mr = textureLod(uDataMaps, vec3(uv, float(m.maps.y)), 0.0);
+    s.roughness *= mr.g;
+    s.metallic *= mr.b;
+  }
+
+  emission = m.emission;
+  if (m.maps.w >= 0) emission *= textureLod(uColorMaps, vec3(uv, float(m.maps.w)), 0.0).rgb;
+
+  s.nc = hit.normal;
+  s.n = hit.normal;
+  if (m.maps.z >= 0 && dot(hit.dpdu, hit.dpdu) > 0.0) {
+    // Tangent frame from the triangle's UV derivatives, built on the outward normal so
+    // back faces see the mirrored perturbation. glTF's +Y points to decreasing v.
+    vec3 N = hit.frontFace ? hit.normal : -hit.normal;
+    vec3 T = normalize(hit.dpdu - N * dot(N, hit.dpdu));
+    vec3 B = cross(N, T);
+    if (dot(B, -hit.dpdv) < 0.0) B = -B;
+    vec3 tn = textureLod(uDataMaps, vec3(uv, float(m.maps.z)), 0.0).xyz * 2.0 - 1.0;
+    tn.xy *= m.normalScale;
+    vec3 mapped = normalize(T * tn.x + B * tn.y + N * max(tn.z, 1e-3));
+    mapped = hit.frontFace ? mapped : -mapped;
+    if (dot(mapped, wo) > 1e-3 && dot(mapped, hit.geomNormal) > 0.0) s.n = mapped;
+  }
+
+  s.ior = m.ior;
+  s.transmission = m.transmission * (1.0 - s.metallic);
+  s.emission = emission;
+  s.clearcoat = m.clearcoat;
+  s.clearcoatRoughness = m.clearcoatRoughness;
+  s.sheenColor = m.sheenColor;
+  s.sheenRoughness = m.sheenRoughness;
+  s.thinWalled = m.thinWalled;
+  s.absorption = m.attenuationDistance > 0.0
+    ? -log(max(m.attenuationColor, vec3(1e-4))) / m.attenuationDistance
+    : vec3(0.0);
+  return s;
+}
+
+struct Guide {
+  vec3 albedo;
+  vec3 normal;
+  float depth;
+  float coverage;
+  bool done;
+};
+
+vec3 tracePath(vec3 ro, vec3 rd, out Guide guide) {
   vec3 radiance = vec3(0.0);
   vec3 throughput = vec3(1.0);
   bool specularBounce = true;
   float bsdfPdf = 0.0;
+  vec3 guideTint = vec3(1.0);
+  guide = Guide(vec3(1.0), -rd, FAR, 0.0, false);
 
   for (int bounce = 0; bounce <= uMaxBounces; bounce++) {
     Hit hit;
     if (!traceScene(ro, rd, INF, hit)) {
-      radiance += clampContribution(throughput * environment(rd, specularBounce, bsdfPdf), bounce);
+      vec3 env = bounce == 0 && uEnvBackground == 0 ? uBackdrop : environment(rd, specularBounce, bsdfPdf);
+      radiance += clampContribution(throughput * env, bounce);
+      if (!guide.done) {
+        guide.albedo = guideTint;
+        guide.normal = -rd;
+        guide.done = true;
+      }
       break;
     }
+    if (bounce == 0) {
+      guide.depth = hit.t;
+      guide.coverage = 1.0;
+    }
 
-    Material m = fetchMaterial(hit.material);
+    vec3 wo = -rd;
+    vec3 emission;
+    Surface s = surfaceAt(hit, wo, emission);
+    vec3 ng = hit.geomNormal;
 
-    if (any(greaterThan(m.emission, vec3(0.0)))) {
+    // Leaving a volume: absorb along the segment just travelled inside it.
+    if (!hit.frontFace && !s.thinWalled && s.transmission > 0.0) throughput *= exp(-s.absorption * hit.t);
+
+    if (any(greaterThan(emission, vec3(0.0)))) {
       float w = 1.0;
       if (!specularBounce && hit.light >= 0) {
         float pl = lightPdf(hit.light, ro, rd, hit.t) / float(uLightCount);
         w = misWeight(bsdfPdf, pl);
       }
-      radiance += clampContribution(throughput * m.emission * w, bounce);
-      break; // emitters are treated as black bodies
+      radiance += clampContribution(throughput * emission * w, bounce);
+      if (!guide.done) {
+        guide.albedo = guideTint;
+        guide.normal = s.n;
+        guide.done = true;
+      }
+      // Explicit lights are black bodies; textured glTF emitters also reflect.
+      if (hit.light >= 0) break;
     }
 
-    vec3 albedo = surfaceAlbedo(m, hit.position);
-    vec3 wo = -rd;
-    vec3 n = hit.normal;
-    vec3 ng = hit.geomNormal;
+    bool glass = s.transmission > 0.0 && rand() < s.transmission;
+    bool mirror = !glass && s.metallic > 0.9 && s.roughness < 0.1;
+    if (!guide.done && !((glass || mirror) && bounce < 3)) {
+      guide.albedo = guideTint * s.albedo;
+      guide.normal = s.n;
+      guide.done = true;
+    }
 
-    bool glass = m.transmission > 0.0 && rand() < m.transmission;
     if (glass) {
       vec3 wi, weight;
       bool reflected;
-      if (!sampleDielectric(albedo, m.roughness, m.ior, hit.frontFace, n, ng, wo, wi, weight, reflected)) break;
+      if (!sampleDielectric(s, hit.frontFace, ng, wo, wi, weight, reflected)) break;
       throughput *= weight;
-      ro = hit.position + ng * (reflected ? RAY_OFFSET : -RAY_OFFSET);
+      if (!guide.done) guideTint *= weight;
+      ro = offsetRay(hit.position, reflected ? ng : -ng);
       rd = wi;
       specularBounce = true;
     } else {
-      vec3 shadowOrigin = hit.position + ng * RAY_OFFSET;
+      if (!guide.done) guideTint *= s.albedo;
+      vec3 shadowOrigin = offsetRay(hit.position, ng);
+      vec3 n = s.n;
 
       // --- Next-event estimation: sun ---------------------------------------
       if (uSunEnabled != 0) {
@@ -102,9 +194,21 @@ vec3 tracePath(vec3 ro, vec3 rd) {
         float NdotL = dot(n, wi);
         if (NdotL > 0.0 && dot(ng, wi) > 0.0 && !occluded(shadowOrigin, wi, INF)) {
           float pb;
-          vec3 f = evalOpaque(albedo, m.metallic, m.roughness, n, wo, wi, pb);
+          vec3 f = evalOpaque(s, wo, wi, pb);
           float w = misWeight(uSunPdf, pb);
           radiance += clampContribution(throughput * f * NdotL * uSunRadiance * (w / uSunPdf), bounce);
+        }
+      }
+
+      // --- Next-event estimation: environment map -----------------------------
+      if (uEnvSampling != 0) {
+        LightSample ls = sampleEnvironment();
+        float NdotL = dot(n, ls.dir);
+        if (ls.pdf > 0.0 && NdotL > 0.0 && dot(ng, ls.dir) > 0.0 && !occluded(shadowOrigin, ls.dir, INF)) {
+          float pb;
+          vec3 f = evalOpaque(s, wo, ls.dir, pb);
+          float w = misWeight(ls.pdf, pb);
+          radiance += clampContribution(throughput * f * NdotL * ls.radiance * (w / ls.pdf), bounce);
         }
       }
 
@@ -114,28 +218,28 @@ vec3 tracePath(vec3 ro, vec3 rd) {
         LightSample ls = sampleLight(li, hit.position, rand2());
         float NdotL = dot(n, ls.dir);
         if (ls.pdf > 0.0 && NdotL > 0.0 && dot(ng, ls.dir) > 0.0 &&
-            !occluded(shadowOrigin, ls.dir, ls.dist - RAY_OFFSET)) {
+            !occluded(shadowOrigin, ls.dir, ls.dist * (1.0 - 1e-4))) {
           float pl = ls.pdf / float(uLightCount);
           float pb;
-          vec3 f = evalOpaque(albedo, m.metallic, m.roughness, n, wo, ls.dir, pb);
+          vec3 f = evalOpaque(s, wo, ls.dir, pb);
           float w = misWeight(pl, pb);
           radiance += clampContribution(throughput * f * NdotL * ls.radiance * (w / pl), bounce);
         }
       }
 
       // --- Continue the path -------------------------------------------------
-      BSDFSample s = sampleOpaque(albedo, m.metallic, m.roughness, n, wo);
-      if (s.pdf <= 0.0 || dot(s.dir, ng) <= 0.0) break;
-      throughput *= s.weight;
-      bsdfPdf = s.pdf;
+      BSDFSample bs = sampleOpaque(s, wo);
+      if (bs.pdf <= 0.0 || dot(bs.dir, ng) <= 0.0) break;
+      throughput *= bs.weight;
+      bsdfPdf = bs.pdf;
       specularBounce = false;
       ro = shadowOrigin;
-      rd = s.dir;
+      rd = bs.dir;
     }
 
     // Russian roulette once the path has had a chance to carry energy.
     if (bounce >= 2) {
-      float p = min(0.95, max(throughput.r, max(throughput.g, throughput.b)));
+      float p = min(0.95, max3(throughput));
       if (rand() >= p) break;
       throughput /= p;
     }
@@ -151,12 +255,16 @@ void main() {
 
   vec3 ro, rd;
   cameraRay(gl_FragCoord.xy, ro, rd);
-  vec3 color = tracePath(ro, rd);
+  Guide guide;
+  vec3 color = tracePath(ro, rd, guide);
 
   // Guard against NaNs poisoning the running average.
   if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
+  float lum = luminance(color);
 
-  vec3 prev = texelFetch(uPrevious, pix, 0).rgb;
   float n = float(uFrame);
-  fragColor = vec4((prev * n + color) / (n + 1.0), 1.0);
+  float k = 1.0 / (n + 1.0);
+  outColor = mix(texelFetch(uPrevColor, pix, 0), vec4(color, lum * lum), k);
+  outAlbedo = mix(texelFetch(uPrevAlbedo, pix, 0), vec4(guide.albedo, guide.coverage), k);
+  outNormal = mix(texelFetch(uPrevNormal, pix, 0), vec4(guide.normal, guide.depth), k);
 }
