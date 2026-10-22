@@ -5,8 +5,10 @@
 **A real-time, progressive path tracer that runs entirely on your GPU.**<br>
 TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~24 kB gzipped
 
-[![CI](https://github.com/clark719664/claudes-dream/actions/workflows/ci.yml/badge.svg)](https://github.com/clark719664/claudes-dream/actions/workflows/ci.yml)
-[![Deploy](https://github.com/clark719664/claudes-dream/actions/workflows/deploy.yml/badge.svg)](https://github.com/clark719664/claudes-dream/actions/workflows/deploy.yml)
+**[Open the live demo →](https://clark719664.github.io/lucent/)**
+
+[![CI](https://github.com/clark719664/lucent/actions/workflows/ci.yml/badge.svg)](https://github.com/clark719664/lucent/actions/workflows/ci.yml)
+[![Deploy](https://github.com/clark719664/lucent/actions/workflows/deploy.yml/badge.svg)](https://github.com/clark719664/lucent/actions/workflows/deploy.yml)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)
 ![WebGL2](https://img.shields.io/badge/WebGL-2.0-990000?logo=webgl&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
