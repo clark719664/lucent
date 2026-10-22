@@ -1,4 +1,5 @@
 import { HDRIS } from '../gallery';
+import { matchPreset, pickPerformance, PRESET_LABELS, type PresetName } from '../perf';
 import type { Renderer, RenderStats, Tonemap } from '../renderer';
 import type { Scene } from '../scene/scene';
 import { formatCount, formatDuration, h } from './dom';
@@ -15,6 +16,10 @@ export interface PanelEvents {
   onResolutionChange: () => void;
   onReset: () => void;
   onScreenshot: () => void;
+  onPresetChange: (preset: PresetName) => void;
+  onScan: () => void;
+  /** Any performance knob moved; settings are already updated. */
+  onPerformanceChange: () => void;
 }
 
 interface SliderSpec {
@@ -45,6 +50,9 @@ export class Panel {
   private readonly statsEl: HTMLElement;
   private readonly sliders: { spec: SliderSpec; input: HTMLInputElement; value: HTMLElement }[] = [];
   private readonly toggles: { spec: ToggleSpec; input: HTMLInputElement }[] = [];
+  private readonly choices: { get: () => string; select: HTMLSelectElement }[] = [];
+  private readonly presetSelect: HTMLSelectElement;
+  private readonly scanNote: HTMLElement;
   private readonly sceneName: HTMLElement;
   private readonly sceneDesc: HTMLElement;
   private readonly pauseBtn: HTMLButtonElement;
@@ -104,6 +112,23 @@ export class Panel {
       this.slider({ label: 'Sky intensity', min: 0, max: 4, step: 0.05, get: () => sky().intensity, set: (v) => (sky().intensity = v), format: (v) => v.toFixed(2), onInput: events.onLightingChange }),
     );
 
+    this.presetSelect = h('select', {
+      class: 'select',
+      'aria-label': 'Performance preset',
+      onChange: (e: Event) => {
+        const v = (e.target as HTMLSelectElement).value;
+        if (v !== 'custom') events.onPresetChange(v as PresetName);
+      },
+    },
+      ...(Object.keys(PRESET_LABELS) as PresetName[]).map((k) => h('option', { value: k }, PRESET_LABELS[k])),
+      h('option', { value: 'custom' }, 'Custom'),
+    );
+    this.scanNote = h('p', { class: 'hint' });
+    const perfChanged = () => {
+      this.syncPreset();
+      events.onPerformanceChange();
+    };
+
     this.root = h('aside', { class: 'panel' },
       h('header', { class: 'panel-header' },
         h('div', { class: 'brand' },
@@ -128,6 +153,21 @@ export class Panel {
         ),
       ),
 
+      this.section('Performance',
+        h('div', { class: 'row' },
+          this.presetSelect,
+          h('button', { class: 'btn btn-fit', title: 'Measure this GPU and apply the recommended settings', onClick: () => events.onScan() }, 'Scan system'),
+        ),
+        this.scanNote,
+        this.slider({ label: 'GPU budget', min: 10, max: 100, step: 5, get: () => Math.round(s.gpuBudget * 100), set: (v) => (s.gpuBudget = v / 100), format: (v) => `${v}%`, onInput: perfChanged }),
+        this.choice('Frame rate', [['30', '30 fps'], ['60', '60 fps'], ['0', 'Display rate']], () => String(s.fpsCap), (v) => (s.fpsCap = Number(v)), perfChanged),
+        this.choice('Stop at', [['512', '512 spp'], ['1024', '1,024 spp'], ['2048', '2,048 spp'], ['4096', '4,096 spp'], ['8192', '8,192 spp'], ['0', 'Never']],
+          () => String(s.maxSamples), (v) => (s.maxSamples = Number(v)), perfChanged),
+        this.slider({ label: 'Resolution', min: 0.25, max: 2, step: 0.25, get: () => s.resolutionScale, set: (v) => (s.resolutionScale = v), format: (v) => `${Math.round(v * 100)}%`, onInput: () => { events.onResolutionChange(); perfChanged(); } }),
+        this.slider({ label: 'Max bounces', min: 1, max: 24, step: 1, get: () => s.maxBounces, set: (v) => (s.maxBounces = v), onInput: () => { events.onSettingsChange(); perfChanged(); } }),
+        this.toggle({ label: 'Pause when the window loses focus', get: () => s.pauseWhenUnfocused, set: (v) => (s.pauseWhenUnfocused = v), onChange: perfChanged }),
+      ),
+
       this.section('Environment',
         this.envSelect,
         this.hdriFields,
@@ -148,10 +188,7 @@ export class Panel {
         this.toggle({ label: 'Denoiser', get: () => s.denoise, set: (v) => (s.denoise = v), onChange: () => undefined }),
         this.toggle({ label: 'Reuse samples while moving', get: () => s.temporal, set: (v) => (s.temporal = v), onChange: () => undefined }),
         this.toggle({ label: 'Lower resolution when slow', get: () => s.adaptiveResolution, set: (v) => (s.adaptiveResolution = v), onChange: () => undefined }),
-        this.slider({ label: 'Max bounces', min: 1, max: 24, step: 1, get: () => s.maxBounces, set: (v) => (s.maxBounces = v), onInput: events.onSettingsChange }),
         this.slider({ label: 'Firefly clamp', min: 0, max: 50, step: 0.5, get: () => s.fireflyClamp, set: (v) => (s.fireflyClamp = v), format: (v) => (v === 0 ? 'off' : v.toFixed(1)), onInput: events.onSettingsChange }),
-        this.slider({ label: 'Samples / frame', min: 0, max: 16, step: 1, get: () => s.samplesPerFrame, set: (v) => (s.samplesPerFrame = v), format: (v) => (v === 0 ? 'auto' : String(v)), onInput: () => undefined }),
-        this.slider({ label: 'Resolution', min: 0.25, max: 2, step: 0.25, get: () => s.resolutionScale, set: (v) => (s.resolutionScale = v), format: (v) => `${Math.round(v * 100)}%`, onInput: events.onResolutionChange }),
       ),
 
       this.section('Display',
@@ -194,6 +231,8 @@ export class Panel {
       value.textContent = spec.format ? spec.format(v) : String(v);
     }
     for (const { spec, input } of this.toggles) input.checked = spec.get();
+    for (const { get, select } of this.choices) select.value = get();
+    this.syncPreset();
     const hdri = this.scene.env.map !== null;
     this.sunSection.hidden = hdri;
     this.hdriFields.hidden = !hdri;
@@ -217,6 +256,8 @@ export class Panel {
       ['Samples / pixel', formatCount(st.samples)],
       ['Elapsed', formatDuration(st.elapsedMs)],
       ['Throughput', `${st.msamplesPerSec.toFixed(1)} Mpaths/s`],
+      ['GPU load', st.gpuLoad === null ? 'measuring' : `${Math.round(st.gpuLoad * 100)}% ${st.gpuLoadMeasured ? '(timer query)' : '(estimated)'}`],
+      ['Cost / sample', st.msPerSample > 0 ? `${st.msPerSample.toFixed(1)} ms` : 'measuring'],
       ['Resolution', res],
       ['Triangles', formatCount(st.triangles)],
       ['BVH nodes', formatCount(st.bvhNodes)],
@@ -257,6 +298,28 @@ export class Panel {
       h('span', {}, spec.label, value),
       input,
     );
+  }
+
+  /** Shows the measured scan result (or a hint before the first scan). */
+  setScanNote(text: string): void {
+    this.scanNote.textContent = text;
+  }
+
+  private syncPreset(): void {
+    this.presetSelect.value = matchPreset(pickPerformance(this.renderer.settings));
+  }
+
+  private choice(label: string, options: [string, string][], get: () => string, set: (v: string) => void, onChange: () => void): HTMLElement {
+    const select = h('select', {
+      class: 'select',
+      onChange: (e: Event) => {
+        set((e.target as HTMLSelectElement).value);
+        onChange();
+      },
+    }, ...options.map(([value, text]) => h('option', { value }, text)));
+    select.value = get();
+    this.choices.push({ get, select });
+    return h('label', { class: 'field' }, h('span', {}, label), select);
   }
 
   private toggle(spec: ToggleSpec): HTMLElement {

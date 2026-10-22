@@ -11,6 +11,7 @@ import {
 import { preprocess, type ShaderSources } from './gl/preprocess';
 import type { BVH } from './math/bvh';
 import { cross, fromSpherical, normalize, scale, sub, type Vec3 } from './math/vec3';
+import { affordableSamples, GpuBudget, PERFORMANCE_PRESETS } from './perf';
 import { bakeSky, buildEnvSampler, type HDRImage } from './scene/environment';
 import { packScene, pickDistance, type Camera, type Ground, type PackedScene, type Scene } from './scene/scene';
 import { SHEEN_LUT_SIZE, sheenAlbedoLUT } from './scene/sheen';
@@ -44,8 +45,14 @@ export interface RenderSettings {
   tonemap: Tonemap;
   /** Internal resolution as a fraction of the canvas' device-pixel size. */
   resolutionScale: number;
-  /** Samples traced per animation frame; 0 adapts it to keep frames near 30 ms. */
+  /** Samples traced per frame; 0 lets the GPU budget decide. */
   samplesPerFrame: number;
+  /** Share of wall-clock time the GPU may spend rendering, 0.05–1. */
+  gpuBudget: number;
+  /** Redraws per second at most; 0 follows the display. */
+  fpsCap: number;
+  /** Read by the app: stop rendering while the window is in the background. */
+  pauseWhenUnfocused: boolean;
   /** Luminance cap for indirect contributions; 0 disables. */
   fireflyClamp: number;
   /** Stop accumulating after this many samples; 0 means never. */
@@ -58,14 +65,19 @@ export interface RenderSettings {
   temporal: boolean;
 }
 
+const BALANCED = PERFORMANCE_PRESETS.balanced;
+
 export const DEFAULT_SETTINGS: RenderSettings = {
-  maxBounces: 6,
+  maxBounces: BALANCED.maxBounces,
   exposure: 1,
   tonemap: 'aces',
-  resolutionScale: 1,
+  resolutionScale: BALANCED.resolutionScale,
   samplesPerFrame: 0,
+  gpuBudget: BALANCED.gpuBudget,
+  fpsCap: BALANCED.fpsCap,
+  pauseWhenUnfocused: BALANCED.pauseWhenUnfocused,
   fireflyClamp: 8,
-  maxSamples: 0,
+  maxSamples: BALANCED.maxSamples,
   denoise: true,
   adaptiveResolution: true,
   temporal: true,
@@ -85,6 +97,14 @@ export interface RenderStats {
   viewHeight: number;
   interactive: boolean;
   denoised: boolean;
+  /** The sample limit has been reached; the GPU is idle. */
+  done: boolean;
+  /** Share of the last second the GPU spent on Lucent's work, or null before it is known. */
+  gpuLoad: number | null;
+  /** True when `gpuLoad` comes from GPU timer queries rather than per-sample estimates. */
+  gpuLoadMeasured: boolean;
+  /** Current estimate of one sample's GPU cost at the traced resolution. */
+  msPerSample: number;
   triangles: number;
   bvhNodes: number;
   textures: number;
@@ -190,9 +210,16 @@ export class Renderer {
   private elapsedAtPause = 0;
   private lastMotion = -Infinity;
   private lastFrameTime = 0;
+  private readonly budget = new GpuBudget(DEFAULT_SETTINGS.gpuBudget);
+  /** Measured GPU cost of one sample at the current traced resolution; 0 = unknown. */
+  private msPerSample = 0;
+  private lastSyncMeasure = 0;
+  private readonly timer: { ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }; pending: { query: WebGLQuery; samples: number }[] } | null;
+  private activeQuery: { query: WebGLQuery; samples: number } | null = null;
+  private gpuWindow = { time: 0, busyMs: 0, load: null as number | null };
+  private displayKey = '';
   private interactive = false;
   private previewScale = 1;
-  private autoSpp = 1;
   private denoisedFrame = -1;
   private denoised: RenderTarget | null = null;
 
@@ -205,6 +232,8 @@ export class Renderer {
     this.variance = new Program(gl, fullscreenVert, preprocess('variance.frag', VARIANCE_SOURCES), VARIANCE_SOURCES);
     this.atrous = new Program(gl, fullscreenVert, preprocess('atrous.frag', ATROUS_SOURCES), ATROUS_SOURCES);
     this.resample = new Program(gl, fullscreenVert, resampleFrag);
+    const timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2') as { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null;
+    this.timer = timerExt ? { ext: timerExt, pending: [] } : null;
     const vao = gl.createVertexArray();
     if (!vao) throw new Error('Failed to create VAO');
     this.vao = vao;
@@ -279,6 +308,7 @@ export class Renderer {
     this.uploadLighting(scene);
     this.uploadCamera(scene.camera, false);
     this.reset();
+    this.msPerSample = 0;
   }
 
   /** Resamples every referenced image into one sRGB and one linear texture array. */
@@ -426,6 +456,7 @@ export class Renderer {
     this.trace.i1('uMaxBounces', this.settings.maxBounces);
     this.trace.f1('uClamp', this.settings.fireflyClamp);
     this.denoisedFrame = -1;
+    this.msPerSample = 0;
   }
 
   /** Resets accumulation; cheap, so callers can be liberal. */
@@ -460,6 +491,7 @@ export class Renderer {
     this.accum = [new RenderTarget(gl, w, h, guides), new RenderTarget(gl, w, h, guides)];
     this.filtered = [new RenderTarget(gl, w, h), new RenderTarget(gl, w, h)];
     this.reset();
+    this.msPerSample = 0;
     return true;
   }
 
@@ -500,13 +532,23 @@ export class Renderer {
     const rw = Math.max(1, Math.round(this.width * s));
     const rh = Math.max(1, Math.round(this.height * s));
     if (rw !== this.renderWidth || rh !== this.renderHeight) {
+      // Cost scales with pixel count, so the estimate survives a preview resize.
+      this.msPerSample *= (rw * rh) / (this.renderWidth * this.renderHeight);
       this.renderWidth = rw;
       this.renderHeight = rh;
       this.invalidateView();
     }
   }
 
-  /** Traces this frame's samples, filters, then presents. Returns true if any tracing was done. */
+  /** True once the sample limit is reached: nothing is traced until something changes. */
+  get isDone(): boolean {
+    return this.settings.maxSamples > 0 && this.frame >= this.settings.maxSamples;
+  }
+
+  /**
+   * Traces the samples this frame's GPU budget pays for, filters, then presents
+   * if anything visible changed. Returns true if any tracing was done.
+   */
   render(): boolean {
     if (!this.accum || !this.filtered || !this.packed) return false;
     const gl = this.gl;
@@ -514,22 +556,11 @@ export class Renderer {
     const dt = this.lastFrameTime ? now - this.lastFrameTime : 0;
     this.lastFrameTime = now;
     this.updatePreview(now, dt);
+    this.pollTimers();
 
-    const { maxSamples, samplesPerFrame } = this.settings;
-    const auto = samplesPerFrame <= 0;
-    let spp = this.interactive ? 1 : auto ? this.autoSpp : samplesPerFrame;
-    if (maxSamples > 0) spp = Math.min(spp, maxSamples - this.frame);
-    const canTrace = !this.paused && spp > 0;
     const rw = this.renderWidth;
     const rh = this.renderHeight;
-
-    if (canTrace) {
-      if (auto && !this.interactive && dt > 0) {
-        if (dt < 24) this.autoSpp = Math.min(32, this.autoSpp + 1);
-        else if (dt > 40) this.autoSpp = Math.max(1, Math.floor(this.autoSpp * 0.75));
-      }
-      this.traceSamples(spp, rw, rh);
-    }
+    const traced = !this.paused && !this.isDone ? this.traceBudgeted(now, rw, rh) : 0;
 
     const latest = this.accum[0];
     const denoise = this.settings.denoise && this.frame > 0 && denoiseWeight(this.frame) > 0;
@@ -537,22 +568,29 @@ export class Renderer {
       this.runDenoiser(latest, rw, rh);
       this.denoisedFrame = this.frame;
     }
+    this.endTimer();
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.width, this.height);
-    const d = this.display;
-    d.use();
-    gl.bindVertexArray(this.vao);
-    this.bindUnits([latest.textures[0]!, latest.textures[1]!, (this.denoised ?? this.filtered[0]).texture]);
-    d.i1('uColor', 0);
-    d.i1('uAlbedo', 1);
-    d.i1('uDenoised', 2);
-    d.f1('uDenoiseWeight', denoise ? denoiseWeight(this.frame) : 0);
-    d.f2('uRenderSize', rw, rh);
-    d.f2('uViewSize', this.width, this.height);
-    d.f1('uExposure', this.settings.exposure);
-    d.i1('uTonemap', this.settings.tonemap === 'aces' ? 0 : this.settings.tonemap === 'reinhard' ? 1 : 2);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const weight = denoise ? denoiseWeight(this.frame) : 0;
+    const { exposure, tonemap } = this.settings;
+    const key = [this.seed, this.frame, rw, rh, this.width, this.height, weight, exposure, tonemap].join('|');
+    if (key !== this.displayKey) {
+      this.displayKey = key;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.width, this.height);
+      const d = this.display;
+      d.use();
+      gl.bindVertexArray(this.vao);
+      this.bindUnits([latest.textures[0]!, latest.textures[1]!, (this.denoised ?? this.filtered[0]).texture]);
+      d.i1('uColor', 0);
+      d.i1('uAlbedo', 1);
+      d.i1('uDenoised', 2);
+      d.f1('uDenoiseWeight', weight);
+      d.f2('uRenderSize', rw, rh);
+      d.f2('uViewSize', this.width, this.height);
+      d.f1('uExposure', exposure);
+      d.i1('uTonemap', tonemap === 'aces' ? 0 : tonemap === 'reinhard' ? 1 : 2);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
 
     const w = this.sampleWindow;
     if (now - w.time > 1000) {
@@ -563,7 +601,102 @@ export class Renderer {
       w.samples = 0;
       w.paths = 0;
     }
-    return canTrace;
+    const g = this.gpuWindow;
+    if (now - g.time > 1000) {
+      g.load = g.time > 0 ? Math.min(1, g.busyMs / (now - g.time)) : null;
+      g.time = now;
+      g.busyMs = 0;
+    }
+    return traced > 0;
+  }
+
+  /**
+   * Spends this frame's share of the GPU budget on samples. The cost of a
+   * sample comes from timer queries when the browser offers them; otherwise it
+   * is re-measured with a synchronous readback every couple of seconds.
+   */
+  private traceBudgeted(now: number, rw: number, rh: number): number {
+    const { samplesPerFrame, maxSamples, gpuBudget, fpsCap } = this.settings;
+    const remaining = maxSamples > 0 ? maxSamples - this.frame : Infinity;
+    if (samplesPerFrame > 0) {
+      const n = Math.min(samplesPerFrame, remaining);
+      this.beginTimer(n);
+      this.traceSamples(n, rw, rh);
+      return n;
+    }
+
+    this.budget.budget = gpuBudget;
+    const frameMs = 1000 / (fpsCap > 0 ? fpsCap : 60);
+    if (this.msPerSample <= 0 || (!this.timer && now - this.lastSyncMeasure > 2000)) {
+      const ms = this.measureSample(rw, rh);
+      this.msPerSample = this.msPerSample > 0 ? this.msPerSample * 0.6 + ms * 0.4 : ms;
+      this.lastSyncMeasure = now;
+      this.budget.allowance(now, 0);
+      this.budget.spend(ms);
+      this.gpuWindow.busyMs += ms;
+      return 1;
+    }
+
+    const allowance = this.budget.allowance(now, Math.max(frameMs * gpuBudget * 2, this.msPerSample * 1.05));
+    // Moving the camera always gets a sample; the budget is repaid once it stops.
+    const n = Math.min(this.interactive ? 1 : affordableSamples(allowance, this.msPerSample), remaining);
+    if (n <= 0) return 0;
+    this.beginTimer(n);
+    this.traceSamples(n, rw, rh);
+    this.budget.spend(n * this.msPerSample);
+    if (!this.timer) this.gpuWindow.busyMs += n * this.msPerSample;
+    return n;
+  }
+
+  /** Traces one sample and waits for the GPU (1-pixel readback) to time it. */
+  private measureSample(rw: number, rh: number): number {
+    this.syncGPU();
+    const t0 = performance.now();
+    this.traceSamples(1, rw, rh);
+    this.syncGPU();
+    return performance.now() - t0;
+  }
+
+  private syncGPU(): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.accum![0].framebuffer);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, new Float32Array(4));
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+  }
+
+  private beginTimer(samples: number): void {
+    if (!this.timer || this.activeQuery || this.timer.pending.length >= 4) return;
+    const query = this.gl.createQuery();
+    if (!query) return;
+    this.gl.beginQuery(this.timer.ext.TIME_ELAPSED_EXT, query);
+    this.activeQuery = { query, samples };
+  }
+
+  private endTimer(): void {
+    if (!this.timer || !this.activeQuery) return;
+    this.gl.endQuery(this.timer.ext.TIME_ELAPSED_EXT);
+    this.timer.pending.push(this.activeQuery);
+    this.activeQuery = null;
+  }
+
+  /** Folds finished timer queries into the per-sample cost and the measured GPU load. */
+  private pollTimers(): void {
+    if (!this.timer) return;
+    const gl = this.gl;
+    const pending = this.timer.pending;
+    while (pending.length > 0) {
+      const { query, samples } = pending[0]!;
+      if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) break;
+      const disjoint = gl.getParameter(this.timer.ext.GPU_DISJOINT_EXT) as boolean;
+      if (!disjoint) {
+        const ms = (gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6;
+        this.gpuWindow.busyMs += ms;
+        if (samples > 0) this.msPerSample = this.msPerSample > 0 ? this.msPerSample * 0.8 + (ms / samples) * 0.2 : ms / samples;
+      }
+      gl.deleteQuery(query);
+      pending.shift();
+    }
   }
 
   private traceSamples(count: number, rw: number, rh: number): void {
@@ -628,6 +761,7 @@ export class Renderer {
     this.traceSamples(samples, this.width, this.height);
     sync(this.accum[0]);
     const traceMs = performance.now() - t0;
+    this.msPerSample = traceMs / samples;
     t0 = performance.now();
     this.runDenoiser(this.accum[0], this.width, this.height);
     sync(this.denoised!);
@@ -697,6 +831,10 @@ export class Renderer {
 
   stats(): RenderStats {
     return {
+      done: this.isDone,
+      gpuLoad: this.paused || this.isDone ? 0 : this.gpuWindow.load,
+      gpuLoadMeasured: this.timer !== null,
+      msPerSample: this.msPerSample,
       samples: this.frame,
       elapsedMs: this.paused ? this.elapsedAtPause : performance.now() - this.startTime,
       msamplesPerSec: this.sampleWindow.pathRate,
