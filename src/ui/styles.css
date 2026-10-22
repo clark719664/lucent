@@ -195,7 +195,7 @@ kbd {
 /* ---- Overlays ---------------------------------------------------------- */
 .hud {
   position: absolute;
-  right: 16px; bottom: 16px;
+  top: 16px; right: 16px;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -379,7 +379,8 @@ kbd {
 
 @media (max-width: 720px) {
   .panel { width: calc(100% - 32px); bottom: auto; max-height: 60vh; }
-  .hud { left: 16px; right: 16px; justify-content: center; }
+  .hud { top: auto; bottom: 16px; left: 16px; right: 16px; justify-content: center; }
+  .toast { bottom: 64px; }
   .gallery { padding: 12px; }
   .gallery-sheet { padding: 16px; }
   .card-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }

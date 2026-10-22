@@ -10,10 +10,23 @@ precision highp sampler2DArray;
 #include "bsdf.glsl"
 
 uniform vec2 uResolution;
-uniform uint uFrame;            // samples accumulated so far
+uniform uint uSeed;             // advances every sample, never resets
 uniform sampler2D uPrevColor;   // running averages, see the outputs below
 uniform sampler2D uPrevAlbedo;
 uniform sampler2D uPrevNormal;
+uniform sampler2D uPrevHistory; // samples behind each pixel's averages
+
+// Temporal reprojection: when the camera has moved since the history was
+// written, each sample looks its primary hit up in the previous view instead
+// of discarding everything accumulated so far.
+uniform int uReproject;
+uniform vec3 uPrevCamPos;
+uniform vec3 uPrevCamRight;
+uniform vec3 uPrevCamUp;
+uniform vec3 uPrevCamForward;
+uniform float uPrevTanHalfFov;
+uniform vec2 uPrevResolution;
+uniform float uHistoryCap;      // bounds lag and ghosting while moving
 
 uniform vec3 uCamPos;
 uniform vec3 uCamRight;
@@ -32,6 +45,7 @@ uniform float uClamp;         // max luminance an indirect sample may contribute
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outAlbedo;
 layout(location = 2) out vec4 outNormal;
+layout(location = 3) out vec4 outHistory;
 
 const float FAR = 1e4;
 
@@ -114,6 +128,8 @@ struct Guide {
   vec3 normal;
   float depth;
   float coverage;
+  vec3 position; // primary hit, for reprojection
+  float reuse;   // 0–1: how view-independent the primary surface is, so how much history it may keep
   bool done;
 };
 
@@ -123,7 +139,7 @@ vec3 tracePath(vec3 ro, vec3 rd, out Guide guide) {
   bool specularBounce = true;
   float bsdfPdf = 0.0;
   vec3 guideTint = vec3(1.0);
-  guide = Guide(vec3(1.0), -rd, FAR, 0.0, false);
+  guide = Guide(vec3(1.0), -rd, FAR, 0.0, vec3(0.0), 1.0, false);
 
   for (int bounce = 0; bounce <= uMaxBounces; bounce++) {
     Hit hit;
@@ -140,6 +156,7 @@ vec3 tracePath(vec3 ro, vec3 rd, out Guide guide) {
     if (bounce == 0) {
       guide.depth = hit.t;
       guide.coverage = 1.0;
+      guide.position = hit.position;
     }
 
     vec3 wo = -rd;
@@ -167,6 +184,13 @@ vec3 tracePath(vec3 ro, vec3 rd, out Guide guide) {
     }
 
     bool glass = s.transmission > 0.0 && rand() < s.transmission;
+    if (bounce == 0) {
+      // Reflections and refractions do not move with the surface, so reprojecting them smears.
+      float sharp = 1.0 - smoothstep(0.1, 0.7, s.roughness);
+      float glossy = max(sharp * mix(0.5, 1.0, s.metallic), s.transmission);
+      glossy = max(glossy, s.clearcoat * 0.5 * (1.0 - smoothstep(0.08, 0.5, s.clearcoatRoughness)));
+      guide.reuse = 1.0 - glossy;
+    }
     bool mirror = !glass && s.metallic > 0.9 && s.roughness < 0.1;
     if (!guide.done && !((glass || mirror) && bounce < 3)) {
       guide.albedo = guideTint * s.albedo;
@@ -247,10 +271,60 @@ vec3 tracePath(vec3 ro, vec3 rd, out Guide guide) {
   return radiance;
 }
 
+// Continuous pixel position of `d` (a point relative to the old camera, or a direction) in the previous view.
+bool projectToPrevious(vec3 d, out vec2 prevPix) {
+  float z = dot(d, uPrevCamForward);
+  if (z <= 1e-6) return false;
+  float aspect = uPrevResolution.x / uPrevResolution.y;
+  vec2 ndc = vec2(dot(d, uPrevCamRight) / (z * uPrevTanHalfFov * aspect), dot(d, uPrevCamUp) / (z * uPrevTanHalfFov));
+  prevPix = (ndc * 0.5 + 0.5) * uPrevResolution;
+  return all(greaterThanEqual(prevPix, vec2(0.0))) && all(lessThan(prevPix, uPrevResolution));
+}
+
+// Bilinear fetch of the previous averages from the taps that saw the same surface (or the same sky).
+bool reprojectHistory(Guide g, vec3 rd, out vec4 color, out vec4 albedo, out vec4 normal, out float samples) {
+  color = vec4(0.0);
+  albedo = vec4(0.0);
+  normal = vec4(0.0);
+  samples = 0.0;
+  bool surface = g.coverage > 0.5;
+  vec3 d = surface ? g.position - uPrevCamPos : rd;
+  vec2 prevPix;
+  if (!projectToPrevious(d, prevPix)) return false;
+  float expected = length(d);
+  vec2 f = prevPix - 0.5;
+  ivec2 base = ivec2(floor(f));
+  vec2 t = f - floor(f);
+  float wsum = 0.0;
+  for (int i = 0; i < 4; i++) {
+    ivec2 o = ivec2(i & 1, i >> 1);
+    ivec2 q = base + o;
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(uPrevResolution)))) continue;
+    vec4 a = texelFetch(uPrevAlbedo, q, 0);
+    vec4 n = texelFetch(uPrevNormal, q, 0);
+    bool same = surface
+      ? a.w > 0.5 && abs(n.w - expected) < 0.02 * expected && dot(normalize(n.xyz + vec3(1e-6)), g.normal) > 0.85
+      : a.w < 0.5;
+    if (!same) continue;
+    float w = (o.x == 1 ? t.x : 1.0 - t.x) * (o.y == 1 ? t.y : 1.0 - t.y);
+    color += texelFetch(uPrevColor, q, 0) * w;
+    albedo += a * w;
+    normal += n * w;
+    samples += texelFetch(uPrevHistory, q, 0).r * w;
+    wsum += w;
+  }
+  if (wsum < 1e-3) return false;
+  color /= wsum;
+  albedo /= wsum;
+  normal /= wsum;
+  samples = min(samples / wsum, uHistoryCap * g.reuse);
+  return true;
+}
+
 void main() {
   ivec2 pix = ivec2(gl_FragCoord.xy);
   uint pixelIndex = uint(pix.x) + uint(pix.y) * uint(uResolution.x);
-  g_seed = pixelIndex * 1973u + uFrame * 9277u + 26699u;
+  g_seed = pixelIndex * 1973u + uSeed * 9277u + 26699u;
   pcg(g_seed);
 
   vec3 ro, rd;
@@ -262,9 +336,20 @@ void main() {
   if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
   float lum = luminance(color);
 
-  float n = float(uFrame);
+  vec4 prevColor, prevAlbedo, prevNormal;
+  float n;
+  if (uReproject == 0) {
+    prevColor = texelFetch(uPrevColor, pix, 0);
+    prevAlbedo = texelFetch(uPrevAlbedo, pix, 0);
+    prevNormal = texelFetch(uPrevNormal, pix, 0);
+    n = texelFetch(uPrevHistory, pix, 0).r;
+  } else if (!reprojectHistory(guide, rd, prevColor, prevAlbedo, prevNormal, n)) {
+    n = 0.0; // disoccluded: start this pixel over
+  }
+
   float k = 1.0 / (n + 1.0);
-  outColor = mix(texelFetch(uPrevColor, pix, 0), vec4(color, lum * lum), k);
-  outAlbedo = mix(texelFetch(uPrevAlbedo, pix, 0), vec4(guide.albedo, guide.coverage), k);
-  outNormal = mix(texelFetch(uPrevNormal, pix, 0), vec4(guide.normal, guide.depth), k);
+  outColor = mix(prevColor, vec4(color, lum * lum), k);
+  outAlbedo = mix(prevAlbedo, vec4(guide.albedo, guide.coverage), k);
+  outNormal = mix(prevNormal, vec4(guide.normal, guide.depth), k);
+  outHistory = vec4(n + 1.0);
 }

@@ -44,12 +44,20 @@ void main() {
   if (uRenderSize == uViewSize) {
     c = radiance(ivec2(gl_FragCoord.xy));
   } else {
-    // Bilinear upsampling of the reduced-resolution preview.
+    // Catmull-Rom upsampling of the reduced-resolution preview: sharper than bilinear.
     vec2 src = gl_FragCoord.xy * (uRenderSize / uViewSize) - 0.5;
     ivec2 i = ivec2(floor(src));
     vec2 f = src - floor(src);
-    c = mix(mix(radiance(i), radiance(i + ivec2(1, 0)), f.x),
-            mix(radiance(i + ivec2(0, 1)), radiance(i + ivec2(1, 1)), f.x), f.y);
+    vec2 w[4];
+    w[0] = f * (-0.5 + f * (1.0 - 0.5 * f));
+    w[1] = 1.0 + f * f * (-2.5 + 1.5 * f);
+    w[2] = f * (0.5 + f * (2.0 - 1.5 * f));
+    w[3] = f * f * (-0.5 + 0.5 * f);
+    c = vec3(0.0);
+    for (int y = 0; y < 4; y++) {
+      for (int x = 0; x < 4; x++) c += radiance(i + ivec2(x - 1, y - 1)) * (w[x].x * w[y].y);
+    }
+    c = max(c, vec3(0.0));
   }
   c *= uExposure;
   if (uTonemap == 0) c = aces(c);

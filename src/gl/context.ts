@@ -176,7 +176,11 @@ export class RenderTarget {
     const fb = gl.createFramebuffer();
     if (!fb) throw new GLError('Failed to allocate render target');
     this.textures = formats.map((f) =>
-      createTexture(gl, width, height, { internalFormat: f, format: gl.RGBA, type: f === gl.RGBA16F ? gl.HALF_FLOAT : gl.FLOAT }),
+      createTexture(gl, width, height, {
+        internalFormat: f,
+        format: f === gl.R32F ? gl.RED : gl.RGBA,
+        type: f === gl.RGBA16F ? gl.HALF_FLOAT : gl.FLOAT,
+      }),
     );
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
     this.textures.forEach((tex, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex, 0));

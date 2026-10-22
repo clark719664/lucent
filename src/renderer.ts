@@ -52,8 +52,10 @@ export interface RenderSettings {
   maxSamples: number;
   /** Edge-aware à-trous filtering of the displayed image. */
   denoise: boolean;
-  /** Trace at reduced resolution while the camera is moving. */
+  /** Drop resolution while the camera moves if frames get slow. */
   adaptiveResolution: boolean;
+  /** Reuse accumulated samples across camera moves by reprojecting them. */
+  temporal: boolean;
 }
 
 export const DEFAULT_SETTINGS: RenderSettings = {
@@ -66,6 +68,7 @@ export const DEFAULT_SETTINGS: RenderSettings = {
   maxSamples: 0,
   denoise: true,
   adaptiveResolution: true,
+  temporal: true,
 };
 
 export interface RenderStats {
@@ -94,6 +97,7 @@ const UNIT = {
   prevColor: 0,
   prevAlbedo: 1,
   prevNormal: 2,
+  prevHistory: 12,
   triGeometry: 3,
   triAttributes: 4,
   bvh: 5,
@@ -107,14 +111,27 @@ const UNIT = {
 
 const TEXTURE_BUDGET_BYTES = 256 * 1024 * 1024;
 const MOTION_HOLD_MS = 160;
-const PREVIEW_TARGET_MS = 25;
+/** Frame time above which the moving preview drops resolution, and below which it recovers. */
+const PREVIEW_SLOW_MS = 40;
+const PREVIEW_FAST_MS = 24;
+const PREVIEW_MIN_SCALE = 0.5;
+/** Samples a reprojected pixel may carry while moving; lower means less lag, more noise. */
+const HISTORY_CAP = 8;
 const ATROUS_STEPS = [1, 2, 4, 8, 16];
 /** Noise falls as 1/√n, so the filter's reach shrinks as samples accumulate. */
 const atrousLevels = (spp: number): number => (spp <= 4 ? 5 : spp <= 16 ? 4 : spp <= 64 ? 3 : spp <= 256 ? 2 : 1);
-/** Weight of the denoised image: full until 512 spp, then a fade to the converged raw image by 2048. */
-const denoiseWeight = (spp: number): number => Math.min(1, Math.max(0, (2048 - spp) / (2048 - 512)));
+/** Weight of the denoised image: full until 128 spp, then a fade to the raw image by 1024. */
+const denoiseWeight = (spp: number): number => Math.min(1, Math.max(0, (1024 - spp) / (1024 - 128)));
 
 const nextPow2 = (n: number) => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
+
+interface CameraState {
+  position: Vec3;
+  forward: Vec3;
+  right: Vec3;
+  up: Vec3;
+  tanHalfFov: number;
+}
 
 function cameraBasis(cam: Camera): { forward: Vec3; right: Vec3; up: Vec3 } {
   const forward = normalize(sub(cam.target, cam.position));
@@ -154,9 +171,15 @@ export class Renderer {
   private packed: PackedScene | null = null;
   private scene: Scene | null = null;
   private textureSize = 0;
-  private cameraVectors = { forward: [0, 0, -1] as Vec3, right: [1, 0, 0] as Vec3, up: [0, 1, 0] as Vec3, tanHalfFov: 1 };
+  private camera: CameraState = { position: [0, 0, 0], forward: [0, 0, -1], right: [1, 0, 0], up: [0, 1, 0], tanHalfFov: 1 };
+  /** Camera and resolution the accumulated history was traced with. */
+  private history: { camera: CameraState; width: number; height: number } | null = null;
+  private reprojectPending = false;
 
+  /** Effective samples per pixel behind the image (capped while moving). */
   private frame = 0;
+  /** RNG stream index; advances every sample and never resets, so moving frames never repeat noise. */
+  private seed = 0;
   private startTime = 0;
   private sampleWindow = { time: 0, samples: 0, paths: 0, sppRate: 0, pathRate: 0 };
   private width = 1;
@@ -168,7 +191,7 @@ export class Renderer {
   private lastMotion = -Infinity;
   private lastFrameTime = 0;
   private interactive = false;
-  private previewScale = 0.5;
+  private previewScale = 1;
   private autoSpp = 1;
   private denoisedFrame = -1;
   private denoised: RenderTarget | null = null;
@@ -194,6 +217,8 @@ export class Renderer {
     t.i1('uPrevColor', UNIT.prevColor);
     t.i1('uPrevAlbedo', UNIT.prevAlbedo);
     t.i1('uPrevNormal', UNIT.prevNormal);
+    t.i1('uPrevHistory', UNIT.prevHistory);
+    t.f1('uHistoryCap', HISTORY_CAP);
     t.i1('uTriGeometry', UNIT.triGeometry);
     t.i1('uTriAttributes', UNIT.triAttributes);
     t.i1('uBVH', UNIT.bvh);
@@ -369,7 +394,7 @@ export class Renderer {
   uploadCamera(cam: Camera, moving = true): void {
     const { forward, right, up } = cameraBasis(cam);
     const tanHalfFov = Math.tan((cam.fov * Math.PI) / 360);
-    this.cameraVectors = { forward, right, up, tanHalfFov };
+    this.camera = { position: [...cam.position], forward, right, up, tanHalfFov };
     const p = this.trace;
     p.use();
     p.f3('uCamPos', cam.position);
@@ -380,7 +405,19 @@ export class Renderer {
     p.f1('uAperture', cam.aperture);
     p.f1('uFocusDist', cam.focusDistance);
     if (moving) this.lastMotion = performance.now();
-    this.reset();
+    this.invalidateView();
+  }
+
+  /** The view changed but the scene did not: reproject the history if allowed, else start over. */
+  private invalidateView(): void {
+    if (this.settings.temporal && this.history && this.frame > 0) {
+      this.reprojectPending = true;
+      this.frame = Math.min(this.frame, HISTORY_CAP);
+      this.startTime = performance.now();
+      this.denoisedFrame = -1;
+    } else {
+      this.reset();
+    }
   }
 
   /** Call after any settings change that affects the integrator. */
@@ -394,6 +431,8 @@ export class Renderer {
   /** Resets accumulation; cheap, so callers can be liberal. */
   reset(): void {
     this.frame = 0;
+    this.history = null;
+    this.reprojectPending = false;
     this.startTime = performance.now();
     this.elapsedAtPause = 0;
     this.denoisedFrame = -1;
@@ -417,7 +456,7 @@ export class Renderer {
     this.canvas.height = h;
     this.accum?.forEach((t) => t.dispose());
     this.filtered?.forEach((t) => t.dispose());
-    const guides = [gl.RGBA32F, gl.RGBA16F, gl.RGBA16F];
+    const guides = [gl.RGBA32F, gl.RGBA16F, gl.RGBA16F, gl.R32F];
     this.accum = [new RenderTarget(gl, w, h, guides), new RenderTarget(gl, w, h, guides)];
     this.filtered = [new RenderTarget(gl, w, h), new RenderTarget(gl, w, h)];
     this.reset();
@@ -445,25 +484,25 @@ export class Renderer {
     return t * (dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2]);
   }
 
-  /** Picks the traced resolution: a frame-time-driven fraction of full while the camera moves. */
+  /**
+   * Picks the traced resolution. While the camera moves, a frame slower than
+   * PREVIEW_SLOW_MS steps the resolution down (never below half) and a fast one
+   * steps it back up; throttled frames from a hidden page are ignored.
+   */
   private updatePreview(now: number, dt: number): void {
-    const moving = this.settings.adaptiveResolution && now - this.lastMotion < MOTION_HOLD_MS;
-    if (moving) {
-      if (this.interactive && dt > 0) {
-        const step = Math.sqrt(PREVIEW_TARGET_MS / dt);
-        this.previewScale = Math.min(1, Math.max(0.2, this.previewScale * Math.min(1.15, Math.max(0.8, step))));
-      }
-      this.interactive = true;
-    } else {
-      this.interactive = false;
+    const moving = now - this.lastMotion < MOTION_HOLD_MS;
+    this.interactive = moving;
+    if (moving && this.settings.adaptiveResolution && dt > 0 && dt < 250) {
+      if (dt > PREVIEW_SLOW_MS) this.previewScale = Math.max(PREVIEW_MIN_SCALE, this.previewScale * 0.85);
+      else if (dt < PREVIEW_FAST_MS) this.previewScale = Math.min(1, this.previewScale * 1.1);
     }
-    const s = this.interactive ? this.previewScale : 1;
+    const s = moving && this.settings.adaptiveResolution ? this.previewScale : 1;
     const rw = Math.max(1, Math.round(this.width * s));
     const rh = Math.max(1, Math.round(this.height * s));
     if (rw !== this.renderWidth || rh !== this.renderHeight) {
       this.renderWidth = rw;
       this.renderHeight = rh;
-      this.reset();
+      this.invalidateView();
     }
   }
 
@@ -533,16 +572,30 @@ export class Renderer {
     gl.bindVertexArray(this.vao);
     this.bindSceneTextures();
     this.trace.f2('uResolution', rw, rh);
+    const units = [UNIT.prevColor, UNIT.prevAlbedo, UNIT.prevNormal, UNIT.prevHistory];
     for (let i = 0; i < count; i++) {
       const read: RenderTarget = this.accum![0];
       const write: RenderTarget = this.accum![1];
       write.bind(rw, rh);
-      read.textures.forEach((tex, unit) => {
-        gl.activeTexture(gl.TEXTURE0 + unit);
+      read.textures.forEach((tex, k) => {
+        gl.activeTexture(gl.TEXTURE0 + units[k]!);
         gl.bindTexture(gl.TEXTURE_2D, tex);
       });
-      this.trace.u1('uFrame', this.frame);
+      const reproject = this.reprojectPending && this.history !== null;
+      if (reproject) {
+        const { camera: c, width, height } = this.history!;
+        this.trace.f3('uPrevCamPos', c.position);
+        this.trace.f3('uPrevCamRight', c.right);
+        this.trace.f3('uPrevCamUp', c.up);
+        this.trace.f3('uPrevCamForward', c.forward);
+        this.trace.f1('uPrevTanHalfFov', c.tanHalfFov);
+        this.trace.f2('uPrevResolution', width, height);
+      }
+      this.trace.i1('uReproject', reproject ? 1 : 0);
+      this.trace.u1('uSeed', this.seed++);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+      this.reprojectPending = false;
+      this.history = { camera: this.camera, width: rw, height: rh };
       this.accum = [write, read];
       this.frame++;
       this.sampleWindow.samples++;
@@ -606,17 +659,17 @@ export class Renderer {
     const v = this.variance;
     v.use();
     a.bind(rw, rh);
-    this.bindUnits([source.textures[0]!, source.textures[1]!, source.textures[2]!]);
+    this.bindUnits([source.textures[0]!, source.textures[1]!, source.textures[2]!, source.textures[3]!]);
     v.i1('uColor', 0);
     v.i1('uAlbedo', 1);
     v.i1('uNormal', 2);
+    v.i1('uHistory', 3);
     v.i2('uSize', rw, rh);
-    v.f1('uSamples', this.frame);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     const t = this.atrous;
     const cam = this.scene!.camera;
-    const { forward, right, up, tanHalfFov } = this.cameraVectors;
+    const { forward, right, up, tanHalfFov } = this.camera;
     t.use();
     t.i1('uInput', 0);
     t.i1('uAlbedo', 1);

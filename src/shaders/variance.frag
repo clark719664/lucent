@@ -5,7 +5,7 @@ precision highp sampler2D;
 #include "denoise.glsl"
 
 uniform sampler2D uColor; // running mean radiance (rgb), running mean luminance² (a)
-uniform float uSamples;
+uniform sampler2D uHistory; // samples behind each pixel's mean
 
 out vec4 fragColor;
 
@@ -21,12 +21,13 @@ void main() {
     return;
   }
   vec3 illum = demodulate(c.rgb, a.rgb);
+  float samples = max(texelFetch(uHistory, p, 0).r, 1.0);
   float la = max(luminance(a.rgb), 1e-3);
 
   float variance;
-  if (uSamples >= 4.0) {
+  if (samples >= 4.0) {
     float l = luminance(c.rgb);
-    variance = max(0.0, c.a - l * l) / (la * la) / uSamples;
+    variance = max(0.0, c.a - l * l) / (la * la) / samples;
   } else {
     vec4 np = texelFetch(uNormal, p, 0);
     vec3 n = unitNormal(np.xyz);
@@ -48,7 +49,7 @@ void main() {
       }
     }
     float m1 = s1 / max(ws, 1e-6);
-    variance = max(0.0, s2 / max(ws, 1e-6) - m1 * m1) / uSamples;
+    variance = max(0.0, s2 / max(ws, 1e-6) - m1 * m1) / samples;
   }
   fragColor = vec4(illum, variance);
 }

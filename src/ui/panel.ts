@@ -142,7 +142,8 @@ export class Panel {
 
       this.section('Integrator',
         this.toggle({ label: 'Denoiser', get: () => s.denoise, set: (v) => (s.denoise = v), onChange: () => undefined }),
-        this.toggle({ label: 'Low-res preview while moving', get: () => s.adaptiveResolution, set: (v) => (s.adaptiveResolution = v), onChange: () => undefined }),
+        this.toggle({ label: 'Reuse samples while moving', get: () => s.temporal, set: (v) => (s.temporal = v), onChange: () => undefined }),
+        this.toggle({ label: 'Lower resolution when slow', get: () => s.adaptiveResolution, set: (v) => (s.adaptiveResolution = v), onChange: () => undefined }),
         this.slider({ label: 'Max bounces', min: 1, max: 24, step: 1, get: () => s.maxBounces, set: (v) => (s.maxBounces = v), onInput: events.onSettingsChange }),
         this.slider({ label: 'Firefly clamp', min: 0, max: 50, step: 0.5, get: () => s.fireflyClamp, set: (v) => (s.fireflyClamp = v), format: (v) => (v === 0 ? 'off' : v.toFixed(1)), onInput: events.onSettingsChange }),
         this.slider({ label: 'Samples / frame', min: 0, max: 16, step: 1, get: () => s.samplesPerFrame, set: (v) => (s.samplesPerFrame = v), format: (v) => (v === 0 ? 'auto' : String(v)), onInput: () => undefined }),
