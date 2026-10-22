@@ -2,27 +2,32 @@ import type { Vec3 } from '../math/vec3';
 import { add, cross, normalize, scale, sub } from '../math/vec3';
 
 /**
- * Triangle soup with per-vertex normals: 9 floats per triangle in each array.
+ * Triangle soup with per-vertex normals: 9 floats per triangle in each array,
+ * plus optional texture coordinates (6 floats per triangle).
  * Non-indexed on purpose; the GPU reads triangles straight out of a texture.
  */
 export interface Mesh {
   positions: Float32Array;
   normals: Float32Array;
+  uvs?: Float32Array;
 }
 
 export const triangleCount = (m: Mesh): number => m.positions.length / 9;
 
+/** Concatenates meshes; texture coordinates are kept (zero-filled) if any input has them. */
 export function mergeMeshes(meshes: readonly Mesh[]): Mesh {
   const total = meshes.reduce((n, m) => n + m.positions.length, 0);
   const positions = new Float32Array(total);
   const normals = new Float32Array(total);
+  const uvs = meshes.some((m) => m.uvs) ? new Float32Array((total / 9) * 6) : null;
   let offset = 0;
   for (const m of meshes) {
     positions.set(m.positions, offset);
     normals.set(m.normals, offset);
+    if (uvs && m.uvs) uvs.set(m.uvs, (offset / 9) * 6);
     offset += m.positions.length;
   }
-  return { positions, normals };
+  return uvs ? { positions, normals, uvs } : { positions, normals };
 }
 
 /** Builds a mesh from an explicit triangle list with flat (face) normals. */
@@ -173,5 +178,5 @@ export function transform(
     normals[i + 1] = ny;
     normals[i + 2] = -nx * sin + nz * cos;
   }
-  return { positions, normals };
+  return mesh.uvs ? { positions, normals, uvs: mesh.uvs } : { positions, normals };
 }

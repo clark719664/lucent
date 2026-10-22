@@ -1,8 +1,19 @@
 import { checker, glass, light, matte, metal, material, type Material } from './material';
 import { box, floor, quad, torusKnot, transform } from './mesh';
+import { proceduralEnvironment } from './environment';
 import type { Scene, Sphere } from './scene';
 
-const defaultSun = (overrides: Partial<Scene['sun']> = {}): Scene['sun'] => ({
+type PresetSpec = Omit<Scene, 'env' | 'ground' | 'textures'>;
+
+/** Presets light themselves with the procedural sky and model their own floors. */
+const preset = (spec: PresetSpec): Scene => ({
+  ...spec,
+  env: proceduralEnvironment(),
+  ground: { enabled: false, height: 0, material: matte([0.5, 0.5, 0.5]) },
+  textures: [],
+});
+
+export const defaultSun = (overrides: Partial<Scene['sun']> = {}): Scene['sun'] => ({
   elevation: 38,
   azimuth: 215,
   color: [1, 0.93, 0.82],
@@ -11,7 +22,7 @@ const defaultSun = (overrides: Partial<Scene['sun']> = {}): Scene['sun'] => ({
   ...overrides,
 });
 
-const daySky = (intensity = 1): Scene['sky'] => ({
+export const daySky = (intensity = 1): Scene['sky'] => ({
   enabled: true,
   zenith: [0.22, 0.42, 0.85],
   horizon: [0.78, 0.86, 0.98],
@@ -47,7 +58,7 @@ function cornell(): Scene {
   const tallBlock = transform(box([-0.3, 0, -0.3], [0.3, 1.2, 0.3]), { rotateY: 0.3, translate: [-0.35, 0, -0.3] });
   const shortBlock = transform(box([-0.3, 0, -0.3], [0.3, 0.6, 0.3]), { rotateY: -0.28, translate: [0.38, 0, 0.35] });
 
-  return {
+  return preset({
     name: 'Cornell Box',
     exposure: 1,
     description: 'Diffuse interreflection, colour bleeding and soft shadows from a single area light.',
@@ -62,7 +73,7 @@ function cornell(): Scene {
       { mesh: tallBlock, material: white },
       { mesh: shortBlock, material: white },
     ],
-  };
+  });
 }
 
 /** Outdoor showroom: sun, sky, a gold trefoil knot and a few hero spheres. */
@@ -82,7 +93,7 @@ function showroom(): Scene {
     { center: [0.2, 0.22, 2.1], radius: 0.22, material: glass([0.9, 1, 0.9], 1.33, 0.08) },
   ];
 
-  return {
+  return preset({
     name: 'Showroom',
     exposure: 0.55,
     description: 'Sun + sky lighting, a BVH-accelerated 9,680-triangle gold knot, caustics and depth of field.',
@@ -94,7 +105,7 @@ function showroom(): Scene {
       { mesh: floor([0, 0, 0], 30), material: ground },
       { mesh: knot, material: metal([1, 0.78, 0.35], 0.18) },
     ],
-  };
+  });
 }
 
 /** Grid of spheres sweeping roughness (x) against metallic (y). */
@@ -119,7 +130,7 @@ function materialStudy(): Scene {
       });
     }
   }
-  return {
+  return preset({
     name: 'Material Study',
     exposure: 0.5,
     description: 'Roughness sweeps left→right. Rows: rough glass, dielectric, dielectric→metal, gold.',
@@ -128,7 +139,7 @@ function materialStudy(): Scene {
     sky: daySky(1.0),
     spheres,
     meshes: [{ mesh: floor([0, 0, 0], 30), material: matte([0.6, 0.6, 0.62], 0.9) }],
-  };
+  });
 }
 
 /** Night scene: only emissive spheres light the world, a stress test for light sampling. */
@@ -139,7 +150,7 @@ function nocturne(): Scene {
     translate: [0, 0.9, 0],
     rotateY: -0.6,
   });
-  return {
+  return preset({
     name: 'Nocturne',
     exposure: 1,
     description: 'No sky. Three coloured emitters sampled explicitly; glass and chrome catch the rest.',
@@ -157,7 +168,7 @@ function nocturne(): Scene {
       { mesh: floor([0, 0, 0], 30), material: ground },
       { mesh: knot, material: material({ albedo: [0.85, 0.2, 0.55], metallic: 0.6, roughness: 0.3 }) },
     ],
-  };
+  });
 }
 
 export const PRESETS: readonly (() => Scene)[] = [showroom, cornell, materialStudy, nocturne];

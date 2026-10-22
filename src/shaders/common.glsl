@@ -5,7 +5,7 @@ const float PI = 3.14159265358979323846;
 const float INV_PI = 0.31830988618379067154;
 const float TWO_PI = 6.28318530717958647692;
 const float INF = 1e30;
-const float EPS = 1e-4;
+const float EPS = 1e-6;
 
 // PCG hash (Jarzynski & Olano 2020). Fast, well-distributed, no texture lookups.
 uint g_seed;
@@ -83,4 +83,26 @@ float misWeight(float a, float b) {
   float a2 = a * a;
   float b2 = b * b;
   return a2 / max(a2 + b2, 1e-10);
+}
+
+float max3(vec3 v) {
+  return max(v.x, max(v.y, v.z));
+}
+
+// Offsets a ray origin off a surface by a few ULPs along `n` (Wächter & Binder 2019,
+// "A Fast and Robust Method for Avoiding Self-Intersection"). Scale-independent, so a
+// 5 cm model and a 50 m floor need no tuned epsilon.
+vec3 offsetRay(vec3 p, vec3 n) {
+  const float origin = 1.0 / 32.0;
+  const float floatScale = 1.0 / 65536.0;
+  const float intScale = 256.0;
+  ivec3 o = ivec3(intScale * n);
+  vec3 pi = vec3(
+    intBitsToFloat(floatBitsToInt(p.x) + (p.x < 0.0 ? -o.x : o.x)),
+    intBitsToFloat(floatBitsToInt(p.y) + (p.y < 0.0 ? -o.y : o.y)),
+    intBitsToFloat(floatBitsToInt(p.z) + (p.z < 0.0 ? -o.z : o.z)));
+  return vec3(
+    abs(p.x) < origin ? p.x + floatScale * n.x : pi.x,
+    abs(p.y) < origin ? p.y + floatScale * n.y : pi.y,
+    abs(p.z) < origin ? p.z + floatScale * n.z : pi.z);
 }

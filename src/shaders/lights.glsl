@@ -1,23 +1,26 @@
 // ---------------------------------------------------------------------------
-// Explicit light sampling (next-event estimation) for sphere and quad emitters
-// plus a directional sun with finite angular size. Every pdf is in solid angle
-// so it can be combined with BSDF pdfs using multiple importance sampling.
+// Explicit light sampling (next-event estimation) for sphere and quad emitters,
+// an importance-sampled environment map, and a directional sun with finite
+// angular size. Every pdf is in solid angle so it can be combined with BSDF
+// pdfs using multiple importance sampling.
 // ---------------------------------------------------------------------------
 uniform vec4 uLights[MAX_LIGHTS * 4]; // see scene.ts for the layout
 uniform int uLightCount;
 
 uniform vec3 uSunDir;       // unit vector towards the sun
 uniform vec3 uSunRadiance;  // colour * irradiance / solid angle
-uniform vec3 uSunColor;     // tint used for the sky glow
 uniform float uSunCosAngle; // cos(angular radius)
 uniform float uSunPdf;      // 1 / solid angle
 uniform int uSunEnabled;
 
-uniform int uSkyEnabled;
-uniform vec3 uSkyZenith;
-uniform vec3 uSkyHorizon;
-uniform vec3 uSkyGround;
-uniform float uSkyIntensity;
+uniform sampler2D uEnvMap;   // equirect radiance (procedural sky baked, or an HDRI)
+uniform sampler2D uEnvAlias; // per cell: keep probability, alias cell, pdfUV, alias pdfUV
+uniform ivec2 uEnvGrid;
+uniform vec2 uEnvRotation;   // cos, sin of the map's rotation about +Y
+uniform float uEnvIntensity;
+uniform int uEnvSampling;    // 0 when the map is black: skip light sampling
+uniform int uEnvBackground;  // 0 = camera rays that miss see uBackdrop
+uniform vec3 uBackdrop;
 
 struct LightSample {
   vec3 dir;
@@ -26,23 +29,60 @@ struct LightSample {
   vec3 radiance;
 };
 
-vec3 sky(vec3 d) {
-  if (uSkyEnabled == 0) return vec3(0.0);
-  float t = clamp(d.y, -1.0, 1.0);
-  vec3 c = t >= 0.0
-    ? mix(uSkyHorizon, uSkyZenith, pow(t, 0.55))
-    : mix(uSkyHorizon, uSkyGround, clamp(-t * 4.0, 0.0, 1.0));
-  if (uSunEnabled != 0) {
-    float s = max(dot(d, uSunDir), 0.0);
-    c += uSunColor * (0.12 * pow(s, 24.0) + 0.5 * pow(s, 400.0));
-  }
-  return c * uSkyIntensity;
+vec3 envToLocal(vec3 d) {
+  return vec3(uEnvRotation.x * d.x - uEnvRotation.y * d.z, d.y, uEnvRotation.y * d.x + uEnvRotation.x * d.z);
 }
 
-// Radiance arriving from infinity. The sun disc is only added with an MIS
-// weight because it is also sampled explicitly at diffuse/glossy vertices.
+vec3 envToWorld(vec3 l) {
+  return vec3(uEnvRotation.x * l.x + uEnvRotation.y * l.z, l.y, -uEnvRotation.y * l.x + uEnvRotation.x * l.z);
+}
+
+// Equirect convention shared with environment.ts: v = 0 is straight up.
+vec2 equirectUV(vec3 l) {
+  return vec2(atan(l.z, l.x) * (0.5 * INV_PI) + 0.5, acos(clamp(l.y, -1.0, 1.0)) * INV_PI);
+}
+
+vec3 envRadiance(vec3 d) {
+  return textureLod(uEnvMap, equirectUV(envToLocal(d)), 0.0).rgb * uEnvIntensity;
+}
+
+// Solid-angle pdf of `sampleEnvironment` producing direction `d`.
+float envPdf(vec3 d) {
+  vec3 l = envToLocal(d);
+  float sinTheta = sqrt(max(0.0, 1.0 - l.y * l.y));
+  if (sinTheta < 1e-6) return 0.0;
+  ivec2 cell = min(ivec2(equirectUV(l) * vec2(uEnvGrid)), uEnvGrid - 1);
+  return texelFetch(uEnvAlias, cell, 0).z / (2.0 * PI * PI * sinTheta);
+}
+
+// O(1) alias-table sample of a map cell, then a uniform point inside it.
+LightSample sampleEnvironment() {
+  LightSample ls;
+  int n = uEnvGrid.x * uEnvGrid.y;
+  int i = min(int(rand() * float(n)), n - 1);
+  vec4 e = texelFetch(uEnvAlias, ivec2(i % uEnvGrid.x, i / uEnvGrid.x), 0);
+  int cell = i;
+  float pdfUV = e.z;
+  if (rand() >= e.x) {
+    cell = int(e.y);
+    pdfUV = e.w;
+  }
+  vec2 uv = (vec2(float(cell % uEnvGrid.x), float(cell / uEnvGrid.x)) + rand2()) / vec2(uEnvGrid);
+  float phi = (uv.x - 0.5) * TWO_PI;
+  float theta = uv.y * PI;
+  float sinTheta = sin(theta);
+  ls.dir = envToWorld(vec3(sinTheta * cos(phi), cos(theta), sinTheta * sin(phi)));
+  ls.dist = INF;
+  ls.pdf = sinTheta > 1e-6 ? pdfUV / (2.0 * PI * PI * sinTheta) : 0.0;
+  ls.radiance = textureLod(uEnvMap, uv, 0.0).rgb * uEnvIntensity;
+  return ls;
+}
+
+// Radiance arriving from infinity along a path. The map and the sun disc are
+// weighted against their light-sampling pdfs unless the bounce was specular.
 vec3 environment(vec3 d, bool specularBounce, float bsdfPdf) {
-  vec3 L = sky(d);
+  vec3 L = envRadiance(d);
+  if (!specularBounce && uEnvSampling != 0) L *= misWeight(bsdfPdf, envPdf(d));
   if (uSunEnabled != 0 && dot(d, uSunDir) >= uSunCosAngle) {
     float w = specularBounce ? 1.0 : misWeight(bsdfPdf, uSunPdf);
     L += uSunRadiance * w;

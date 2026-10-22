@@ -1,7 +1,13 @@
 #version 300 es
 precision highp float;
+precision highp sampler2D;
 
-uniform sampler2D uImage;
+uniform sampler2D uColor;    // running mean radiance
+uniform sampler2D uAlbedo;   // guide albedo, coverage
+uniform sampler2D uDenoised; // filtered illumination
+uniform float uDenoiseWeight; // 0 = raw accumulation
+uniform vec2 uRenderSize;    // traced region; smaller than the view while orbiting
+uniform vec2 uViewSize;
 uniform float uExposure;
 uniform int uTonemap; // 0 = ACES, 1 = Reinhard, 2 = none (clip)
 
@@ -23,8 +29,37 @@ float ign(vec2 p) {
   return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
+vec3 radiance(ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(uRenderSize) - 1);
+  vec3 raw = texelFetch(uColor, p, 0).rgb;
+  if (uDenoiseWeight > 0.0) {
+    vec4 a = texelFetch(uAlbedo, p, 0);
+    if (a.w >= 0.5) return mix(raw, texelFetch(uDenoised, p, 0).rgb * max(a.rgb, vec3(1e-3)), uDenoiseWeight);
+  }
+  return raw;
+}
+
 void main() {
-  vec3 c = texelFetch(uImage, ivec2(gl_FragCoord.xy), 0).rgb * uExposure;
+  vec3 c;
+  if (uRenderSize == uViewSize) {
+    c = radiance(ivec2(gl_FragCoord.xy));
+  } else {
+    // Catmull-Rom upsampling of the reduced-resolution preview: sharper than bilinear.
+    vec2 src = gl_FragCoord.xy * (uRenderSize / uViewSize) - 0.5;
+    ivec2 i = ivec2(floor(src));
+    vec2 f = src - floor(src);
+    vec2 w[4];
+    w[0] = f * (-0.5 + f * (1.0 - 0.5 * f));
+    w[1] = 1.0 + f * f * (-2.5 + 1.5 * f);
+    w[2] = f * (0.5 + f * (2.0 - 1.5 * f));
+    w[3] = f * f * (-0.5 + 0.5 * f);
+    c = vec3(0.0);
+    for (int y = 0; y < 4; y++) {
+      for (int x = 0; x < 4; x++) c += radiance(i + ivec2(x - 1, y - 1)) * (w[x].x * w[y].y);
+    }
+    c = max(c, vec3(0.0));
+  }
+  c *= uExposure;
   if (uTonemap == 0) c = aces(c);
   else if (uTonemap == 1) c = c / (1.0 + c);
   c = linearToSrgb(clamp(c, 0.0, 1.0));

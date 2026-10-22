@@ -3,7 +3,7 @@
 # Lucent
 
 **A real-time, progressive path tracer that runs entirely on your GPU.**<br>
-TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~24 kB gzipped
+TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~46 kB gzipped
 
 **[Open the live demo →](https://clark719664.github.io/lucent/)**
 
@@ -13,15 +13,15 @@ TypeScript · WebGL2 · GLSL ES 3.0 · zero runtime dependencies · ~24 kB gzipp
 ![WebGL2](https://img.shields.io/badge/WebGL-2.0-990000?logo=webgl&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-<img src="docs/screenshots/hero.png" alt="Lucent rendering the Showroom scene" width="900">
+<img src="docs/screenshots/hero.jpg" alt="Lucent rendering the Car Concept glTF model at dawn" width="900">
 
-*Showroom: a 9,680-triangle gold trefoil, glass, brushed copper and depth of field, lit by a physical sun and sky.*
+*Car Concept (glTF, 213,347 triangles) under a Poly Haven dawn HDRI: clearcoat paint, glass and a glossy ground. 1024 samples per pixel at 1440 × 900 in 26 s on a Radeon RX 7600.*
 
 </div>
 
 ---
 
-Lucent is a physically based renderer written from scratch: no three.js, no WebGPU polyfills, no shader libraries. Every photon path is traced in a fragment shader against a bounding-volume hierarchy built in TypeScript, and the result converges on screen as you watch. Drag to orbit, click to refocus, and the image restarts from a clean slate.
+Lucent is a physically based renderer written from scratch: no three.js, no WebGPU polyfills, no shader libraries. Drop a glTF model onto the page and it is traced in a fragment shader against a bounding-volume hierarchy built in TypeScript, lit by an importance-sampled HDRI, denoised while it converges and reprojected while you orbit.
 
 It exists to be read as much as to be run. The code is small enough to hold in your head and documented where the ideas are non-obvious.
 
@@ -29,32 +29,68 @@ It exists to be read as much as to be run. The code is small enough to hold in y
 
 | | |
 |:--:|:--:|
-| <img src="docs/screenshots/cornell.png" width="440"><br>**Cornell Box** — diffuse interreflection and colour bleeding from one area light, sampled explicitly | <img src="docs/screenshots/nocturne.png" width="440"><br>**Nocturne** — no sky; three emitters light a chrome sphere, glass and a (3,4) torus knot |
-| <img src="docs/screenshots/material.png" width="440"><br>**Material Study** — roughness sweeps left to right across rough glass, dielectric, dielectric→metal and gold | <img src="docs/screenshots/showroom.png" width="440"><br>**Showroom** — sun + sky, caustics through glass, thin-lens bokeh |
+| <img src="docs/screenshots/toycar.jpg" width="440"><br>**Toy Car**: clearcoat paint, sheen fabric, glass | <img src="docs/screenshots/dragon.jpg" width="440"><br>**Dragon**: refraction with Beer–Lambert absorption |
+| <img src="docs/screenshots/sheen-chair.jpg" width="440"><br>**Sheen Chair**: Charlie sheen velvet, texture transforms | <img src="docs/screenshots/helmet.jpg" width="440"><br>**Damaged Helmet**: metal-rough, normal and emissive maps |
+| <img src="docs/screenshots/chess.jpg" width="440"><br>**A Beautiful Game**: 1,499,072 triangles, 33 textures | <img src="docs/screenshots/denoiser.jpg" width="440"><br>**Denoiser**: the same 8 samples per pixel, raw (left) and filtered (right) |
+
+The glTF models above are in the in-app gallery and stream from the [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets); the four built-in scenes need no network at all:
+
+| | |
+|:--:|:--:|
+| <img src="docs/screenshots/showroom.png" width="440"><br>**Showroom**: sun + sky, caustics through glass, thin-lens bokeh | <img src="docs/screenshots/cornell.png" width="440"><br>**Cornell Box**: diffuse interreflection from one area light |
+| <img src="docs/screenshots/material.png" width="440"><br>**Material Study**: roughness sweeps across glass, dielectric and metal | <img src="docs/screenshots/nocturne.png" width="440"><br>**Nocturne**: no sky; three emitters, chrome, glass and a torus knot |
 
 ## What's inside
 
+**Scenes**
+
+- **glTF 2.0 and GLB loading**, written from scratch and tested under Node: node hierarchies, indexed, strip and fan primitives, interleaved, normalized and sparse accessors, mirrored transforms. Drop a `.glb`, a `.gltf` with its `.bin` and images, or the folder holding them, or use *Open file…*.
+- **PBR materials**: base colour with alpha mask and blend, metal-rough, normal and emissive maps, `KHR_texture_transform`, and the `transmission`, `ior`, `volume`, `clearcoat`, `sheen`, `emissive_strength` and `unlit` material extensions. Extensions it does not model are listed in a toast rather than silently dropped; files that require Draco, meshopt or KTX2 are refused with a clear message.
+- **Textures** are resampled on the GPU (mipmapped, filtered in linear space) into one sRGB and one linear 2D texture array, sized to a 256 MB budget.
+- **Gallery** of Khronos sample models, each paired with a CC0 HDRI from Poly Haven, plus the four built-in scenes.
+
 **Rendering**
 
-- **Unidirectional path tracing** with Russian roulette, progressive accumulation into ping-ponged `RGBA32F` targets, and a separate tone-mapping pass (ACES filmic, Reinhard or clip) with dithering.
-- **Next-event estimation with multiple importance sampling** (power heuristic) against sphere lights, quad lights and a sun of finite angular size. Emitter hits via BSDF sampling are weighted by the matching solid-angle pdf, so there is no double counting and no dependence on luck for small lights.
-- **Microfacet BSDF**: Lambert + GGX with Smith masking, Schlick Fresnel, and [visible-normal sampling](https://jcgt.org/published/0007/04/01/) (Heitz 2018). Metallic, roughness, transmission and IOR are the knobs; glass is a stochastic dielectric with a roughened normal.
-- **Thin-lens camera** with concentric-disk bokeh and a planar focal plane. Click any point to focus there: the pick ray is intersected on the CPU with the same BVH the GPU uses.
-- **Procedural sky** with a horizon gradient and sun glow; the sun disc itself is only ever added with an MIS weight.
-- **Firefly suppression** via a luminance clamp on indirect contributions, user-adjustable because it trades bias for variance.
+- **Unidirectional path tracing** with Russian roulette, per-pixel running averages in ping-ponged multiple render targets, and a separate tone-mapping pass (ACES filmic, Reinhard or clip) with dithering.
+- **HDRI environments with importance sampling.** Radiance `.hdr` files are decoded in TypeScript; the map is split into up to 1024 × 512 cells weighted by luminance × sin θ and turned into a [Walker alias table](https://en.wikipedia.org/wiki/Alias_method), so drawing a light sample costs one texel fetch, and the exact piecewise-constant pdf is available for MIS. The procedural sky is baked into the same path, so even the built-in scenes sample their sky explicitly now.
+- **Next-event estimation with multiple importance sampling** (power heuristic) against the environment map, sphere lights, quad lights and a sun of finite angular size.
+- **Layered BSDF**: a GGX clearcoat (with its own, un-normal-mapped normal) over Charlie sheen over a Lambert + GGX base with [visible-normal sampling](https://jcgt.org/published/0007/04/01/). Every lobe takes part in one mixture pdf, so MIS sees the whole material. F0 follows the IOR; sheen is energy-compensated with an albedo table integrated at start-up.
+- **Glass**: a stochastic dielectric with a roughened normal, thin-walled sheets that transmit without bending, and Beer–Lambert absorption inside volumes.
+- **Alpha cut-outs in the traversal**: alpha-tested triangles are evaluated as an any-hit test in both closest-hit and shadow rays, so leaves cast leaf-shaped shadows.
+- **Thin-lens camera** with click-to-focus (the pick ray is intersected on the CPU with the same BVH the GPU uses), and scale-independent ray offsets ([Wächter & Binder 2019](https://link.springer.com/chapter/10.1007/978-1-4842-4427-2_6)) so a 5 cm model and a 50 m floor need no tuned epsilon.
+
+**Interaction**
+
+- **Denoiser**: an SVGF-style edge-avoiding à-trous filter ([Dammertz 2010](https://jo.dreggn.org/home/2010_atrous.pdf), [Schied 2017](https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced)). The trace pass writes albedo, normal and depth guides at the first non-mirror vertex, so reflections and refractions keep their detail. Lighting is demodulated by albedo, filtered with a variance-guided luminance edge-stop, then multiplied back; the filter's reach shrinks as samples accumulate and it fades out by 1024 spp.
+- **Temporal reprojection**: when the camera moves, every sample projects its primary hit into the previous view and reuses that pixel's history if depth and normal agree. How much history a pixel may keep depends on how glossy it is, so mirrors and glass never smear.
+- **Adaptive preview**: resolution drops (never below half, upsampled with Catmull-Rom) only when frames take longer than 40 ms, and samples per frame adapt to the GPU when the camera is still.
+- **HUD** with samples per pixel, samples per second and camera paths per second, all measured.
 
 **Acceleration**
 
-- **Binned SAH BVH** built in TypeScript (12 bins, leaf cost vs. split cost, median fallback for degenerate centroids) and flattened to an 8-float node layout where sibling nodes are adjacent, so an interior node stores one child index.
-- **Texture-backed geometry**: triangles, nodes and materials are uploaded as 2048-wide `RGBA32F` textures and addressed with `texelFetch` as flat arrays. Triangles are written in leaf order so leaves index the triangle texture directly, with no indirection table.
-- **Stack-based traversal** on the GPU with near-child-first ordering and a separate any-hit variant for shadow rays.
+- **Binned SAH BVH** built in TypeScript on flat typed arrays with an explicit stack (12 bins; large nodes bin all three axes), on a Web Worker for big models so the page keeps rendering. Nodes flatten to an 8-float layout where siblings are adjacent.
+- **Texture-backed geometry**: triangle positions (3 texels) and shading attributes (4 texels) live in separate 2048-wide `RGBA32F` textures, so traversal touches only what intersection needs. Triangles are written in leaf order; there is no index buffer.
 
 **Engineering**
 
 - Strict TypeScript (`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), ESLint, Vitest.
+- 69 unit tests: the glTF parser (GLB containers, hierarchies, strips, interleaved and sparse data, extensions), the RGBE decoder, alias tables, the environment pdf integrating to one, the sheen table against Monte Carlo, BVH invariants and BVH-vs-brute-force agreement, mesh generators, material and scene packing.
 - A `#include` preprocessor for GLSL that rewrites driver error messages back to chunk names and line numbers.
-- 36 unit tests covering the math library, BVH construction invariants, BVH-vs-brute-force agreement on random soups and real meshes, mesh generators (closed-surface checks), material packing round-trips and scene packing.
 - GitHub Actions for lint → typecheck → test → build, and a Pages deployment.
+
+## Performance
+
+Measured with `Renderer.benchmark()`, which waits for the GPU with a 1-pixel readback, at 1280 × 720 on an AMD Radeon RX 7600 (Chrome, ANGLE/D3D11), 6 bounces:
+
+| Scene | Triangles | Camera paths / s | ms per sample |
+|---|---:|---:|---:|
+| Cornell Box | 36 | 106 M | 8.7 |
+| Car Concept | 213,347 | 62 M | 14.8 |
+| Toy Car | 108,936 | 54 M | 17.2 |
+| A Beautiful Game | 1,499,072 | 49 M | 19.0 |
+| Showroom | 9,682 | 47 M | 19.6 |
+
+Showroom is slower than models with twenty times its triangles because sunlit glass and a mirror-finish gold knot keep paths alive for every bounce. One denoiser run costs 2–10 ms at this size. The 1.5 M-triangle chess set builds its BVH in about 3 s on the worker, then packs and uploads in under a second.
 
 ## Run it
 
@@ -70,7 +106,7 @@ npm run typecheck
 npm run build      # production bundle in dist/
 ```
 
-Requires a browser with WebGL2 and `EXT_color_buffer_float` (every current desktop browser). A discrete GPU gives tens of samples per pixel per second at 1080p; integrated graphics still converge in seconds.
+Requires a browser with WebGL2 and `EXT_color_buffer_float` (every current desktop browser).
 
 ### Controls
 
@@ -80,83 +116,99 @@ Requires a browser with WebGL2 and `EXT_color_buffer_float` (every current deskt
 | Shift-drag / right-drag | Pan |
 | Wheel | Dolly |
 | Click | Set focus distance |
+| Drop files | Load a `.glb`, a `.gltf` with its files or folder, or an `.hdr` |
+| `G` | Gallery |
+| `D` | Denoiser on / off |
 | `Space` | Pause / resume |
 | `R` | Restart accumulation |
-| `S` | Save PNG |
+| `S` | Save PNG (as displayed, denoised and tone-mapped) |
 | `H` | Hide / show panel |
 
-URL parameters: `?scene=2` selects a preset, `&ui=0` hides the panel.
+URL parameters: `?scene=2` selects a built-in scene, `?model=ToyCar` a gallery model, `&ui=0` hides all chrome.
 
 ## How it works
 
 ```
-                 TypeScript (once per scene)                      GPU (every frame)
- ┌──────────────────────────────────────────────┐   ┌──────────────────────────────────────┐
- │  presets.ts ──► Scene { spheres, meshes,     │   │  trace.frag                          │
- │                         camera, sun, sky }   │   │   ├─ cameraRay()  thin lens + jitter │
- │        │                                     │   │   ├─ traceScene() BVH + spheres      │
- │        ▼                                     │   │   ├─ NEE: sun + one emitter (MIS)    │
- │  packScene() ─┬─ buildBVH()  SAH, flattened  │   │   ├─ sampleOpaque() / sampleDielectric│
- │               ├─ triangles  (leaf order)     │──►│   └─ running average ──► RGBA32F     │
- │               ├─ materials  (4 texels each)  │   │                     ▲      │  ping   │
- │               └─ lights     (sphere | quad)  │   │                     └──────┘  pong   │
- │        │                                     │   │  display.frag                        │
- │        ▼                                     │   │   └─ exposure → ACES → sRGB → dither │
- │  createDataTexture() ×3  (2048-wide RGBA32F) │   └──────────────────────────────────────┘
- └──────────────────────────────────────────────┘
+ TypeScript (once per scene)                        GPU (every frame)
+ ┌──────────────────────────────────────────┐   ┌────────────────────────────────────────────┐
+ │ loaders/gltf.ts ─► meshes, materials,    │   │ trace.frag  (MRT, per pixel)               │
+ │ loaders/hdr.ts     images, HDR map       │   │  ├─ cameraRay()   thin lens + jitter       │
+ │        │                                 │   │  ├─ traceScene()  BVH, alpha any-hit       │
+ │        ▼                                 │   │  ├─ NEE: env (alias) + sun + emitter, MIS  │
+ │ bvh.worker.ts ─ binned SAH, flattened    │──►│  ├─ layered BSDF / dielectric              │
+ │ packScene()   ─ geometry, attributes,    │   │  └─ reproject or accumulate ─► 4 targets   │
+ │                 materials, texture layers│   │ variance.frag + atrous.frag ×1–5  denoise  │
+ │ buildEnvSampler() ─ alias table          │   │ display.frag  remodulate, upsample, tone   │
+ └──────────────────────────────────────────┘   └────────────────────────────────────────────┘
 ```
 
-**One sample, one pixel.** Each frame the trace shader generates a jittered camera ray, follows it for up to *N* bounces, and blends the returned radiance into the running average `(prev · n + L) / (n + 1)`. Any change to the camera, lights or integrator settings resets `n` to zero.
+**One sample, one pixel.** Each frame the trace shader generates a jittered camera ray, follows it for up to *N* bounces and blends the result into the pixel's running average `(prev · n + L) / (n + 1)`, where *n* is stored per pixel. Lighting or scene changes reset *n*; camera changes reproject it.
 
-**At every opaque vertex** the integrator does three things: samples a direction towards the sun, samples a point on one randomly chosen emitter, and samples the BSDF to continue the path. The first two are shadow-tested with the any-hit traversal and weighted with the power heuristic against the BSDF pdf; when the continued path later hits an emitter, the emitter's own solid-angle pdf is recomputed from the previous vertex so the two estimators combine without bias.
+**At every opaque vertex** the integrator samples the environment map, the sun and one randomly chosen emitter, shadow-tests each with the any-hit traversal and weights it with the power heuristic against the BSDF pdf; then it samples the BSDF to continue. When the continued path later escapes or hits an emitter, the matching light pdf is recomputed so the estimators combine without bias.
 
-**Glass is a delta lobe.** Dielectrics pick reflection or refraction by Fresnel, flag the bounce as specular, and skip light sampling; whatever they hit next is counted in full. Roughness perturbs the microfacet normal before the Fresnel decision, which is a cheap approximation to rough transmission that looks right.
+**The environment sampler** picks a cell uniformly, keeps it with the alias table's probability or jumps to its alias, then picks a uniform point inside it. The cell's probability divided by the equirect Jacobian `2π² sin θ` is the exact solid-angle pdf, which `envPdf()` recomputes for any direction a BSDF sample escapes along.
 
-**The BVH layout** is the detail that makes the shader simple. A node is two texels: `(min.xyz, leftFirst)` and `(max.xyz, count)`. `count > 0` means a leaf whose triangles start at `leftFirst`; otherwise the children are `leftFirst` and `leftFirst + 1`. Because triangles are reordered into leaf order at pack time, the GPU never touches an index buffer.
+**The denoiser never sees textures.** Radiance is divided by the guide albedo before filtering and multiplied back after, so blurring the illumination cannot blur a decal. Guides are taken at the first non-mirror vertex, so a car's windscreen is denoised with the albedo of the seats behind it.
+
+**The BVH layout** keeps the shader simple. A node is two texels: `(min.xyz, leftFirst)` and `(max.xyz, count)`. `count > 0` means a leaf whose triangles start at `leftFirst`; otherwise the children are `leftFirst` and `leftFirst + 1`.
 
 ## Project layout
 
 ```
 src/
-├── main.ts              app wiring, keyboard shortcuts, render loop
-├── renderer.ts          Renderer: targets, uniforms, accumulate/present, picking
+├── main.ts              app wiring: gallery, drag-and-drop, keyboard, render loop
+├── renderer.ts          Renderer: targets, uniforms, accumulation, reprojection, denoiser, picking
+├── gallery.ts           remote models and HDRIs
 ├── gl/
-│   ├── context.ts       context creation, Program, RenderTarget, data textures
+│   ├── context.ts       context, Program, MRT targets, data textures, texture arrays
 │   └── preprocess.ts    #include resolver with #line remapping
+├── loaders/
+│   ├── gltf.ts          glTF 2.0 / GLB parser (DOM-free)
+│   ├── hdr.ts           Radiance RGBE decoder
+│   └── model.ts         files and URLs → decoded images → framed Scene
 ├── math/
-│   ├── vec3.ts          immutable tuple vectors
-│   ├── aabb.ts          bounds, SAH surface area, slab test
-│   ├── ray.ts           Möller–Trumbore and sphere intersection
-│   └── bvh.ts           binned SAH build, flattened layout, CPU traversal
+│   ├── vec3.ts, aabb.ts, ray.ts
+│   ├── bvh.ts           binned SAH build, flattened layout, CPU traversal
+│   ├── bvh.worker.ts    off-thread builds; bvh-async.ts picks the thread
+│   └── alias.ts         Walker/Vose alias tables
 ├── scene/
-│   ├── material.ts      principled-lite material + texel packing
+│   ├── material.ts      principled material + texel packing
+│   ├── environment.ts   HDR images, importance sampler, sky baking
+│   ├── sheen.ts         sheen albedo table
 │   ├── mesh.ts          quad, box, floor, torus knot, transforms
 │   ├── scene.ts         Scene types, packScene(), light extraction, picking
-│   └── presets.ts       the four demo scenes
+│   └── presets.ts       the built-in scenes
 ├── shaders/
-│   ├── common.glsl      PCG RNG, bases, sampling, MIS
-│   ├── scene.glsl       texture fetches, BVH traversal, any-hit
-│   ├── lights.glsl      sky, sun, sphere/quad light sampling & pdfs
-│   ├── bsdf.glsl        GGX/VNDF, Fresnel, opaque & dielectric sampling
-│   ├── trace.frag       the integrator
-│   └── display.frag     tone mapping
-└── ui/                  orbit controls, panel, DOM helper, styles
-test/                    Vitest suites (math, BVH, meshes, scene packing, preprocessor)
+│   ├── common.glsl      PCG RNG, bases, sampling, MIS, ray offsets
+│   ├── scene.glsl       geometry and material fetches, BVH traversal, alpha any-hit
+│   ├── lights.glsl      environment, sun, sphere/quad lights and their pdfs
+│   ├── bsdf.glsl        clearcoat, sheen, GGX/VNDF, dielectrics
+│   ├── trace.frag       the integrator and temporal reprojection
+│   ├── variance.frag, atrous.frag, denoise.glsl   the denoiser
+│   ├── display.frag     remodulation, upsampling, tone mapping
+│   └── resample.frag    texture-array layer resampling
+└── ui/                  panel, HUD, gallery, drag-and-drop, orbit controls, DOM helper, styles
+test/                    Vitest suites
 ```
 
 ## Design notes
 
-- **Why uniform arrays for spheres but textures for triangles?** Spheres are few and analytic; a uniform array is the fastest path and keeps them out of the BVH. Triangles can number in the hundreds of thousands, which only fits in textures.
-- **Why not WebGPU?** Compute shaders would allow wavefront path tracing and a cleaner traversal, but WebGL2 runs everywhere today including iOS, and a fragment-shader megakernel is a better teaching artefact: the entire integrator is one readable file.
-- **Why clamp fireflies at all?** Caustic paths (diffuse → glass → light) have unbounded variance in a unidirectional tracer. The clamp only affects indirect bounces and is exposed in the UI, so you can see exactly what it costs.
-- **Shading normals** on the knot are guarded against facing away from the geometric normal, which otherwise produces black silhouettes on smooth meshes.
+- **Why an alias table rather than a CDF?** A two-level CDF needs a binary search per light sample, about 20 dependent texture fetches on a 1024 × 512 grid; the alias table needs one. Both give the same exact pdf.
+- **Why are mirrors excluded from reprojection?** A reflection does not move with the surface that shows it, so reprojected mirror radiance smears. Pixels keep history in proportion to how rough and how non-metallic their surface is; glass and polished metal start from fresh samples each frame and lean on the denoiser instead.
+- **Why texture arrays?** WebGL2 has no bindless textures. Two arrays (sRGB and linear) at one shared size keep the sampler count fixed whatever the model; resampling happens once on the GPU.
+- **Why not WebGPU?** Compute shaders would allow wavefront path tracing, but WebGL2 runs everywhere today, and a fragment-shader megakernel keeps the whole integrator in one readable file.
+- **Why clamp fireflies at all?** Caustic paths (diffuse → glass → light) have unbounded variance in a unidirectional tracer. The clamp only affects indirect bounces and is exposed in the UI.
 
 ## Roadmap
 
-- Triangle-mesh loading (glTF) and textured materials
-- Environment maps with importance sampling
+- Next-event estimation for emissive triangles (glTF emitters are found by BSDF sampling only)
+- `KHR_lights_punctual`, Draco / meshopt geometry and KTX2 textures
 - Spectral dispersion for dielectrics
-- A temporal denoiser for the first few samples
+- OpenEXR environments
+
+## Credits
+
+Gallery models: [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets); Toy Car (Guido Odendahl, Eric Chadwick, CC0), Dragon (Stanford CG Lab and Morgan McGuire; glTF CC0), Sheen Chair and Velvet Sofa (Wayfair; CC0 and CC BY), Damaged Helmet (theblueturtle_, CC BY-NC; ctxwing, CC BY), Car Concept and Chronograph Watch (Darmstadt Graphics Group, CC BY), Antique Camera (UX3D, CC0), A Beautiful Game (ASWF, Ed Mackey, CC BY). HDRIs: [Poly Haven](https://polyhaven.com/hdris), CC0.
 
 ## License
 
